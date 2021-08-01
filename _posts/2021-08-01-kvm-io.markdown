@@ -1,0 +1,8 @@
+---
+layout: post
+title:  "kvm io model"
+date:   2021-08-01 09:20:16 +0800
+categories: virtualization 
+---
+
+[qemu-io](/assets/kvm_io_model/kvm_io.pdf)
