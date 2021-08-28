@@ -5,7 +5,7 @@ date:   2021-08-28 10:20:16 +0800
 categories: FPGA 
 ---
 
-#### 1. declare pc_alu as a register, and use always(*) to assign i_test to pc_alu. Xilinx systhesis tool will treat pc_alu as a wire.
+#### 1. declare pc_alu as a register, and use always(*) to assign i_test to pc_alu. Xilinx synthesis tool will treat pc_alu as a wire.
    
 ```c
 module test(
@@ -58,3 +58,16 @@ assign pc_alu = i_test;
 ```
 
 ![wire](/assets/verilog/wire.png)
+
+#### 4. Declare pc_alu as a wire, hten use non-Continuous Assignment, the synthesis would fail.
+
+```c
+wire pc_alu;
+
+always@(posedge i_clk)
+begin
+    o_val <= {2'b0, pc_alu, i_reset};
+end
+
+always@(*)pc_alu = i_test;
+```
