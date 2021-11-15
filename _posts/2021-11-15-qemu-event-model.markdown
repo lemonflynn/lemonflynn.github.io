@@ -4,8 +4,6 @@ title:  "QEMU event model"
 date:   2021-11-15 20:20:16 +0800
 categories: virtualization 
 ---
-
-# QEMU event model
 ## event loop
 QEMU使用了glib的事件循环分发处理机制来处理异步事件，简单来说就是使用一个线程poll不同的event：
 - 文件描述符

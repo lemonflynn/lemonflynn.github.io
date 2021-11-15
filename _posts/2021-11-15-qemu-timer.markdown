@@ -1,12 +1,9 @@
 ---
 layout: post
-title:  "QEMU Timer"
+title:  "Timer implementation in QEMU"
 date:   2021-11-15 20:20:16 +0800
 categories: virtualization 
 ---
-
-# Timer implementation in QEMU
-
 ## Clock type
 QEMU中定义了如下四种时钟：
 1. QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新
