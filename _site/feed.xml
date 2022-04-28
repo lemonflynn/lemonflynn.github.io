@@ -1,4 +1,148 @@
-<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" ><generator uri="https://jekyllrb.com/" version="3.9.0">Jekyll</generator><link href="http://localhost:4000/feed.xml" rel="self" type="application/atom+xml" /><link href="http://localhost:4000/" rel="alternate" type="text/html" /><updated>2021-10-18T08:33:45+08:00</updated><id>http://localhost:4000/feed.xml</id><title type="html">Slow and Fast</title><subtitle>Slow and fast are couple of relative concepts, i hope to record the fast changing tech(and world) in this slow way.</subtitle><entry><title type="html">由一个小小错误导致FPGA上各种奇怪问题</title><link href="http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA.html" rel="alternate" type="text/html" title="由一个小小错误导致FPGA上各种奇怪问题" /><published>2021-10-18T08:20:16+08:00</published><updated>2021-10-18T08:20:16+08:00</updated><id>http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA</id><content type="html" xml:base="http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA.html">&lt;h1 id=&quot;问题&quot;&gt;问题&lt;/h1&gt;
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" ><generator uri="https://jekyllrb.com/" version="3.9.0">Jekyll</generator><link href="http://localhost:4000/feed.xml" rel="self" type="application/atom+xml" /><link href="http://localhost:4000/" rel="alternate" type="text/html" /><updated>2022-04-28T09:28:10+08:00</updated><id>http://localhost:4000/feed.xml</id><title type="html">Slow and Fast</title><subtitle>Slow and fast are couple of relative concepts, i hope to record the fast changing tech(and world) in this slow way.</subtitle><entry><title type="html">poll implementation</title><link href="http://localhost:4000/tech/2022/04/27/linux-poll.html" rel="alternate" type="text/html" title="poll implementation" /><published>2022-04-27T20:20:16+08:00</published><updated>2022-04-27T20:20:16+08:00</updated><id>http://localhost:4000/tech/2022/04/27/linux-poll</id><content type="html" xml:base="http://localhost:4000/tech/2022/04/27/linux-poll.html">&lt;p&gt;在用户层调用poll后，内核使用do_sys_poll来处理需要poll的fds，主要过程如下：&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;首先会将需要监听的fd从用户层拷贝到内核&lt;/li&gt;
+  &lt;li&gt;然后创建一个poll_wqueues结构，初始化polling_task为current，用来被唤醒时传入try_to_wake_up函数&lt;/li&gt;
+  &lt;li&gt;设置poll_table中的poll_queue_proc默认为__poll_wait&lt;/li&gt;
+  &lt;li&gt;轮询所有fd，调用file-&amp;gt;f_op-&amp;gt;poll(), 设备的驱动程序一般会在注册的poll中调用poll_wait(filp, &amp;amp;dev’s_wait_queue_head_t, poll_table)，实际会调用__poll_wait, poll_table_entry主要包含wait_queue_t wait和wait_queue_head_t wait_address，同时poll_wqueues结构中的poll_table_entry分为两类，一类是静态分配的，大小固定，另一类是按页动态分配，所以该函数首先为需要监听的fd分配一个poll_table_entry，接着初始化entry中的wait的wait_queue_func_t为pollwake，wait_address由设备驱动程序实现的poll传入，最后将这个wait_queue插入到wait_queue_head中
+&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;add_wait_queue(wait_address, &amp;amp;entry-&amp;gt;wait)&lt;/code&gt;&lt;/li&gt;
+  &lt;li&gt;调用poll_schedule_timeout让当前进程sleep，从而block住用户程序&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;void poll_wait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
+{
+    if (p &amp;amp;&amp;amp; wait_address)    
+        p-&amp;gt;qproc(filp, wait_address, p);
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/qemu/poll1.png&quot; alt=&quot;1&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/qemu/poll2.png&quot; alt=&quot;1&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/qemu/poll3.png&quot; alt=&quot;1&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;当设备准备好数据后，调用wakeup来唤醒wait_queue_head_t中所有的wait_queue，进而pollwake会被调用，该函数会重新将poll_wqeueues中的polling_task（也就是调用了poll的应用程序）进程重新放入调度器的run_queue中。&lt;/p&gt;</content><author><name></name></author><category term="Tech" /><summary type="html">在用户层调用poll后，内核使用do_sys_poll来处理需要poll的fds，主要过程如下： 首先会将需要监听的fd从用户层拷贝到内核 然后创建一个poll_wqueues结构，初始化polling_task为current，用来被唤醒时传入try_to_wake_up函数 设置poll_table中的poll_queue_proc默认为__poll_wait 轮询所有fd，调用file-&amp;gt;f_op-&amp;gt;poll(), 设备的驱动程序一般会在注册的poll中调用poll_wait(filp, &amp;amp;dev’s_wait_queue_head_t, poll_table)，实际会调用__poll_wait, poll_table_entry主要包含wait_queue_t wait和wait_queue_head_t wait_address，同时poll_wqueues结构中的poll_table_entry分为两类，一类是静态分配的，大小固定，另一类是按页动态分配，所以该函数首先为需要监听的fd分配一个poll_table_entry，接着初始化entry中的wait的wait_queue_func_t为pollwake，wait_address由设备驱动程序实现的poll传入，最后将这个wait_queue插入到wait_queue_head中 add_wait_queue(wait_address, &amp;amp;entry-&amp;gt;wait) 调用poll_schedule_timeout让当前进程sleep，从而block住用户程序</summary></entry><entry><title type="html">自问自答系列</title><link href="http://localhost:4000/tech/2021/11/19/think-powerhouse.html" rel="alternate" type="text/html" title="自问自答系列" /><published>2021-11-19T20:20:16+08:00</published><updated>2021-11-19T20:20:16+08:00</updated><id>http://localhost:4000/tech/2021/11/19/think-powerhouse</id><content type="html" xml:base="http://localhost:4000/tech/2021/11/19/think-powerhouse.html"></content><author><name></name></author><category term="Tech" /><summary type="html"></summary></entry><entry><title type="html">QEMU event model</title><link href="http://localhost:4000/virtualization/2021/11/15/qemu-event-model.html" rel="alternate" type="text/html" title="QEMU event model" /><published>2021-11-15T20:20:16+08:00</published><updated>2021-11-15T20:20:16+08:00</updated><id>http://localhost:4000/virtualization/2021/11/15/qemu-event-model</id><content type="html" xml:base="http://localhost:4000/virtualization/2021/11/15/qemu-event-model.html">&lt;h2 id=&quot;event-loop&quot;&gt;event loop&lt;/h2&gt;
+&lt;p&gt;QEMU使用了glib的事件循环分发处理机制来处理异步事件，简单来说就是使用一个线程poll不同的event：&lt;/p&gt;
+&lt;ul&gt;
+  &lt;li&gt;文件描述符&lt;/li&gt;
+  &lt;li&gt;Event notifier&lt;/li&gt;
+  &lt;li&gt;Timer&lt;/li&gt;
+  &lt;li&gt;Bottom-half&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;在这个机制中主要有三个概念：&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;&lt;strong&gt;GMainContext&lt;/strong&gt;- 代表主事件循环的上下文，与GMainLooper绑定，GMainContext和GMLooper为一对一的关系，同样GMainLooper和线程也是一对一的关系　&lt;/li&gt;
+  &lt;li&gt;&lt;strong&gt;GMainLooper&lt;/strong&gt;- 代表一个事件循环，和线程绑定&lt;/li&gt;
+  &lt;li&gt;&lt;strong&gt;GSource&lt;/strong&gt;- 事件源，多个事件源可以绑定到同一个循环上下文中， 这些事件源包含Idle, Timeout 和 I/O，同时也支持创建自定义的事件源。&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;处理流程：&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;g_main_context_prepare 会遍历所有注册到GMainContext上的事件源GSource, 找到最近要到期的定时任务（将来这个超时时间会作为poll/select/epoll的超时时间，时间到了可以派发定时任务）&lt;/li&gt;
+  &lt;li&gt;g_main_context_query　函数用于收集事件源GSource关心的文件描述符&lt;/li&gt;
+  &lt;li&gt;g_main_context_poll　则调用poll/select/epoll观察文件描述符事件，注意超时事件为prepare阶段计算到的timeout时间&lt;/li&gt;
+  &lt;li&gt;g_main_context_check() 注意这里已经从poll/select/epoll函数返回了，无非就是两种情况，一种为有观察的文件描述符事件到来，另一种为超时，也可能两种情况都有触发。（其实还有一种情况是注册了新的GSource或者GSource 增加了新的文件描述符或新的超时函数）总之poll/select/epoll返回了，g_main_context_check调用每个事件源来的check方法来确认是否真的是关心的事件到达，这里把就绪的事件源收集起来&lt;/li&gt;
+  &lt;li&gt;g_main_context_dispatch() 派发事件，也就是把４中收集到的事件源进行事件派发。&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h2 id=&quot;qemu-线程&quot;&gt;QEMU 线程&lt;/h2&gt;
+&lt;p&gt;QEMU在启动后，会有如下不同的线程：&lt;/p&gt;
+&lt;ul&gt;
+  &lt;li&gt;vCPU线程，用来执行虚拟机代码&lt;/li&gt;
+  &lt;li&gt;主循环线程，用来轮询不同的event loop&lt;/li&gt;
+  &lt;li&gt;IO线程,用来处理设备的模拟逻辑&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;主循环线程&quot;&gt;主循环线程&lt;/h3&gt;
+&lt;p&gt;主线程总共有３个event loop,　一个是glib GMainContext和另外两个AioContext，QEMU主线程使用qemu_poll_ns来轮询处理这三个loop,两个AioContext中，第一个为iohander_ctx，用来实现qemu_set_fd_handler, 主要用于net,audio,vfio等；另外一个使用包含新特性的qemu_aio_ctx，这个context使用aio_poll来轮询，主要用于block I/O, ioeventfd，timer和bottom halves。&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;主循环的初始化
+    &lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;int qemu_init_main_loop(Error **errp)
+{
+ ...
+ qemu_aio_context = aio_context_new(&amp;amp;local_error);//创建qemu_aio_context
+ if (!qemu_aio_context) {
+     error_propagate(errp, local_error);
+     return -EMFILE;
+ }
+ qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
+ gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
+ src = aio_get_g_source(qemu_aio_context);
+ g_source_set_name(src, &quot;aio-context&quot;);
+ g_source_attach(src, NULL);
+ g_source_unref(src);
+ src = iohandler_get_g_source();//创建iohandler_ctx
+ g_source_set_name(src, &quot;io-handler&quot;);
+ g_source_attach(src, NULL);
+ g_source_unref(src);
+ return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;主循环loop的设置
+qemu的主循环main_loop会一直调用main_loop_wait函数来监听所有的异步事件，main_loop_wait函数会遍历定时器链表，找出最近的超时时间，然后调用os_host_main_loop_wait
+    &lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;static int os_host_main_loop_wait(int64_t timeout)
+{
+ GMainContext *context = g_main_context_default();
+ int ret;
+
+ g_main_context_acquire(context);
+
+ glib_pollfds_fill(&amp;amp;timeout); //prepare阶段，设定需要监听的fds
+
+ qemu_mutex_unlock_iothread();//释放iothread锁
+ replay_mutex_unlock();
+
+ //调用ppoll来监听所关心的文件描述符，并设定超时时间
+ ret = qemu_poll_ns((GPollFD *)gpollfds-&amp;gt;data, gpollfds-&amp;gt;len, timeout);
+
+ replay_mutex_lock();
+ qemu_mutex_lock_iothread();
+
+ //用来分发处理poll中结果
+ glib_pollfds_poll();
+
+ g_main_context_release(context);
+
+ return ret;
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+    &lt;h3 id=&quot;io线程&quot;&gt;IO线程&lt;/h3&gt;
+    &lt;p&gt;IO线程中有２个event loop，一个是AioContext，使用aio_poll来轮询处理，一个glib GMainContext，需要使用g_main_loop_run来轮询处理,其伪代码如下：&lt;/p&gt;
+    &lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;iothread_run
+ -&amp;gt;while(iothread-&amp;gt;running)
+     -&amp;gt;aio_poll(iothread-&amp;gt;ctx)
+     -&amp;gt;g_main_loop_run(iothread-&amp;gt;main_loop)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+    &lt;h2 id=&quot;aiocontext新特性&quot;&gt;AioContext新特性&lt;/h2&gt;
+  &lt;/li&gt;
+  &lt;li&gt;牺牲一点cpu损耗，换更低的延迟&lt;/li&gt;
+  &lt;li&gt;在遍历需要监听的文件描述符时有O(1)的时间复杂度&lt;/li&gt;
+  &lt;li&gt;纳秒级的timer&lt;/li&gt;
+&lt;/ol&gt;</content><author><name></name></author><category term="virtualization" /><summary type="html">event loop QEMU使用了glib的事件循环分发处理机制来处理异步事件，简单来说就是使用一个线程poll不同的event： 文件描述符 Event notifier Timer Bottom-half</summary></entry><entry><title type="html">Timer implementation in QEMU</title><link href="http://localhost:4000/virtualization/2021/11/15/qemu-timer.html" rel="alternate" type="text/html" title="Timer implementation in QEMU" /><published>2021-11-15T20:20:16+08:00</published><updated>2021-11-15T20:20:16+08:00</updated><id>http://localhost:4000/virtualization/2021/11/15/qemu-timer</id><content type="html" xml:base="http://localhost:4000/virtualization/2021/11/15/qemu-timer.html">&lt;h2 id=&quot;clock-type&quot;&gt;Clock type&lt;/h2&gt;
+&lt;p&gt;QEMU中定义了如下四种时钟：&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新&lt;/li&gt;
+  &lt;li&gt;QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新&lt;/li&gt;
+  &lt;li&gt;QEMU_CLOCK_HOST: host时钟，也就是墙上时钟&lt;/li&gt;
+  &lt;li&gt;QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h2 id=&quot;相关数据结构&quot;&gt;相关数据结构&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&quot;/assets/qemu/qemu_timer.png&quot; alt=&quot;1&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;如上图所示，QEMU定义了一个包含４类QEMUClock的qemu_clocks数组，同时QEMU会创建类型为QEMUTimeListGroup的全局变量main_loop_tlg, 这个变量用来管理使用&lt;em&gt;timer_new_ms&lt;/em&gt;注册的不同时钟类型的定时器，同时针对每一个的AioContext,其中也有一个QEMUTimeListGroup类型的成员变量tlg，用来管理使用&lt;em&gt;aio_timer_new&lt;/em&gt;注册的定时器。新建的定时器用QEMUTimer代表，根据其截止时间排序后插入指定时钟类型的QEMUTimelist中的active_timer链表中。&lt;/p&gt;
+
+&lt;p&gt;当某一类型的lock发生状态变化时（使能或失能，溢出等）， QEMU会调用QEMUClock挂在链表timerlist中的所有QEMUTimeListGroup的notify_cb函数。&lt;/p&gt;
+
+&lt;h2 id=&quot;更新机制&quot;&gt;更新机制&lt;/h2&gt;
+&lt;p&gt;对于使用&lt;em&gt;timer_new_ms&lt;/em&gt;注册的定时器，QEMU在main_loop_wait中调用qemu_clock_run_all_timers来处理定时器。 对于使用&lt;em&gt;aio_timer_new&lt;/em&gt;注册的定时器，则在aio_ctx_dispatch阶段使用timerlistgroup_run_timers来处理。处理步骤也很简单，根据当前时间判断，依次调用定时器链表中所有满足截止时间的定时器的callback函数。&lt;/p&gt;
+
+&lt;h2 id=&quot;备注&quot;&gt;备注&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&quot;/assets/qemu/qemu_timer2.png&quot; alt=&quot;2&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;所以在QEMU中注册的所有定时器中，假如有两个定时器的截止时间是一样的，他们也不是同时执行，而是有先后顺序的。所以定时器中不能做耗时长的操作，否则会影响其他定时器的准时执行。&lt;/p&gt;</content><author><name></name></author><category term="virtualization" /><summary type="html">Clock type QEMU中定义了如下四种时钟： QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新 QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新 QEMU_CLOCK_HOST: host时钟，也就是墙上时钟 QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟</summary></entry><entry><title type="html">由一个小小错误导致FPGA上各种奇怪问题</title><link href="http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA.html" rel="alternate" type="text/html" title="由一个小小错误导致FPGA上各种奇怪问题" /><published>2021-10-18T08:20:16+08:00</published><updated>2021-10-18T08:20:16+08:00</updated><id>http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA</id><content type="html" xml:base="http://localhost:4000/fpga/2021/10/18/strange-behavior-in-FPGA.html">&lt;h1 id=&quot;问题&quot;&gt;问题&lt;/h1&gt;
 &lt;p&gt;经过iverilog验证过设计，生成bitstream下载到FPGA开发板上后出现了各种各样奇怪的问题：&lt;/p&gt;
 
 &lt;ol&gt;
@@ -410,14 +554,4 @@ kernel使用list来管理所有的workqueue，list head为workqueues，每个wor
 &lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
 &lt;p&gt;该函数将work插入到wq中对应cpu（调用该函数的cpu）的cpu_workqueue中的worklist，并使用wake_up(more_work)来唤醒workerthread去处理worklist。&lt;/p&gt;
 
-&lt;p&gt;内核还准备了一个全局的workqueue，这样就只需要调用&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;schedule_work(struct work_struct *work)&lt;/code&gt;就可以将work放入keventfd_wq中。&lt;/p&gt;</content><author><name></name></author><category term="kernel" /><summary type="html">linux中的workqueue可以用来执行延迟执行一些操作，这些操作可以不是原子操作，一般可以用来实现中断的下半部。我们来分析一下它的实现机制。</summary></entry><entry><title type="html">Introduction about kvm and qemu</title><link href="http://localhost:4000/virtualization/2021/08/01/qemu-kvm-vm.html" rel="alternate" type="text/html" title="Introduction about kvm and qemu" /><published>2021-08-01T08:20:16+08:00</published><updated>2021-08-01T08:20:16+08:00</updated><id>http://localhost:4000/virtualization/2021/08/01/qemu-kvm-vm</id><content type="html" xml:base="http://localhost:4000/virtualization/2021/08/01/qemu-kvm-vm.html">&lt;p&gt;&lt;a href=&quot;/assets/qemu_kvm_vm/qemu-kvm.pdf&quot;&gt;qemu-kvm&lt;/a&gt;&lt;/p&gt;</content><author><name></name></author><category term="virtualization" /><summary type="html">qemu-kvm</summary></entry><entry><title type="html">Qemu Thread Model</title><link href="http://localhost:4000/2021/08/01/qemu-thread-model.html" rel="alternate" type="text/html" title="Qemu Thread Model" /><published>2021-08-01T00:00:00+08:00</published><updated>2021-08-01T00:00:00+08:00</updated><id>http://localhost:4000/2021/08/01/qemu-thread-model</id><content type="html" xml:base="http://localhost:4000/2021/08/01/qemu-thread-model.html">&lt;h1 id=&quot;non-iothread&quot;&gt;non-iothread&lt;/h1&gt;
-&lt;p&gt;早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。&lt;/p&gt;
-&lt;h1 id=&quot;iothread&quot;&gt;iothread&lt;/h1&gt;
-&lt;p&gt;non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。&lt;/p&gt;
-
-&lt;p&gt;新的线程模型是为每一个vcpu分配一个线程，外加一个main loop线程（用来监听文件描述符、eventfd、定时器和中断下半部），可能还会有设备的worker thread（用来卸载main loop的负载，例如vnc）。因为QEMU的代码不是thread-safe的，也就意味着QEMU的代码不能同时被多个线程运行，所以需要一个全局mutex来保证。当vcpu从guest code中退出到qemu中时，需要运行&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;qemu_mutex_lock_iothread&lt;/code&gt;来获取这个全局锁，之后才能执行QEMU的代码；在进入guest code前使用&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;qemu_mutex_unlock_iothread&lt;/code&gt;来释放该锁。&lt;/p&gt;
-
-&lt;h1 id=&quot;引用&quot;&gt;引用&lt;/h1&gt;
-&lt;p&gt;&lt;a href=&quot;http://blog.vmsplice.net/2011/03/qemu-internals-overall-architecture-and.html&quot;&gt;QEMU Internals: Overall architecture and threading model&lt;/a&gt;&lt;/p&gt;
-
-&lt;p&gt;&lt;a href=&quot;http://blog.vmsplice.net/2020/08/qemu-internals-event-loops.html&quot;&gt;QEMU Internals: Event loops&lt;/a&gt;&lt;/p&gt;</content><author><name></name></author><summary type="html">non-iothread 早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。 iothread non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。</summary></entry></feed>
+&lt;p&gt;内核还准备了一个全局的workqueue，这样就只需要调用&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;schedule_work(struct work_struct *work)&lt;/code&gt;就可以将work放入keventfd_wq中。&lt;/p&gt;</content><author><name></name></author><category term="kernel" /><summary type="html">linux中的workqueue可以用来执行延迟执行一些操作，这些操作可以不是原子操作，一般可以用来实现中断的下半部。我们来分析一下它的实现机制。</summary></entry></feed>
