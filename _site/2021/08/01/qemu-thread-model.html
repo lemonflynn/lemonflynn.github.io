@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1"><!-- Begin Jekyll SEO tag v2.7.1 -->
+<title>Qemu Thread Model | Slow and Fast</title>
+<meta name="generator" content="Jekyll v3.9.0" />
+<meta property="og:title" content="Qemu Thread Model" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="non-iothread 早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。 iothread non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。" />
+<meta property="og:description" content="non-iothread 早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。 iothread non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。" />
+<link rel="canonical" href="http://localhost:4000/2021/08/01/qemu-thread-model.html" />
+<meta property="og:url" content="http://localhost:4000/2021/08/01/qemu-thread-model.html" />
+<meta property="og:site_name" content="Slow and Fast" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2021-08-01T00:00:00+08:00" />
+<meta name="twitter:card" content="summary" />
+<meta property="twitter:title" content="Qemu Thread Model" />
+<script type="application/ld+json">
+{"@type":"BlogPosting","mainEntityOfPage":{"@type":"WebPage","@id":"http://localhost:4000/2021/08/01/qemu-thread-model.html"},"url":"http://localhost:4000/2021/08/01/qemu-thread-model.html","headline":"Qemu Thread Model","description":"non-iothread 早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。 iothread non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。","dateModified":"2021-08-01T00:00:00+08:00","datePublished":"2021-08-01T00:00:00+08:00","@context":"https://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+<link rel="stylesheet" href="/assets/main.css"><link type="application/atom+xml" rel="alternate" href="http://localhost:4000/feed.xml" title="Slow and Fast" /></head>
+<body><header class="site-header" role="banner">
+
+  <div class="wrapper"><a class="site-title" rel="author" href="/">Slow and Fast</a><nav class="site-nav">
+        <input type="checkbox" id="nav-trigger" class="nav-trigger" />
+        <label for="nav-trigger">
+          <span class="menu-icon">
+            <svg viewBox="0 0 18 15" width="18px" height="15px">
+              <path d="M18,1.484c0,0.82-0.665,1.484-1.484,1.484H1.484C0.665,2.969,0,2.304,0,1.484l0,0C0,0.665,0.665,0,1.484,0 h15.032C17.335,0,18,0.665,18,1.484L18,1.484z M18,7.516C18,8.335,17.335,9,16.516,9H1.484C0.665,9,0,8.335,0,7.516l0,0 c0-0.82,0.665-1.484,1.484-1.484h15.032C17.335,6.031,18,6.696,18,7.516L18,7.516z M18,13.516C18,14.335,17.335,15,16.516,15H1.484 C0.665,15,0,14.335,0,13.516l0,0c0-0.82,0.665-1.483,1.484-1.483h15.032C17.335,12.031,18,12.695,18,13.516L18,13.516z"/>
+            </svg>
+          </span>
+        </label>
+
+        <div class="trigger"><a class="page-link" href="/about/">About</a></div>
+      </nav></div>
+</header>
+<main class="page-content" aria-label="Content">
+      <div class="wrapper">
+        <article class="post h-entry" itemscope itemtype="http://schema.org/BlogPosting">
+
+  <header class="post-header">
+    <h1 class="post-title p-name" itemprop="name headline">Qemu Thread Model</h1>
+    <p class="post-meta">
+      <time class="dt-published" datetime="2021-08-01T00:00:00+08:00" itemprop="datePublished">Aug 1, 2021
+      </time></p>
+  </header>
+
+  <div class="post-content e-content" itemprop="articleBody">
+    <h1 id="non-iothread">non-iothread</h1>
+<p>早期的qemu并不支持多线程，它只有一个线程，在这个线程中完成vcpu、设备模拟和事件处理等逻辑；当该线程正在执行vcpu虚拟机的代码时，如果此时虚拟机发生了一个异常或该线程收到了一个信号，则cpu从执行虚拟机的代码切换到qemu代码，然后根据select的返回结果去处理对应的文件描述符，等完成设备的模拟逻辑后，就接着执行虚拟机的代码。</p>
+<h1 id="iothread">iothread</h1>
+<p>non-iothread的模型并不能利用多核处理器的性能，假如传入-smp 2，即要虚拟出2个vcpu，此时qemu也只有一个线程，在该线程中轮流交替的选择一个vcpu来运行，其也只是用到了一个物理cpu。</p>
+
+<p>新的线程模型是为每一个vcpu分配一个线程，外加一个main loop线程（用来监听文件描述符、eventfd、定时器和中断下半部），可能还会有设备的worker thread（用来卸载main loop的负载，例如vnc）。因为QEMU的代码不是thread-safe的，也就意味着QEMU的代码不能同时被多个线程运行，所以需要一个全局mutex来保证。当vcpu从guest code中退出到qemu中时，需要运行<code class="language-plaintext highlighter-rouge">qemu_mutex_lock_iothread</code>来获取这个全局锁，之后才能执行QEMU的代码；在进入guest code前使用<code class="language-plaintext highlighter-rouge">qemu_mutex_unlock_iothread</code>来释放该锁。</p>
+
+<h1 id="引用">引用</h1>
+<p><a href="http://blog.vmsplice.net/2011/03/qemu-internals-overall-architecture-and.html">QEMU Internals: Overall architecture and threading model</a></p>
+
+<p><a href="http://blog.vmsplice.net/2020/08/qemu-internals-event-loops.html">QEMU Internals: Event loops</a></p>
+
+  </div><a class="u-url" href="/2021/08/01/qemu-thread-model.html" hidden></a>
+</article>
+
+      </div>
+    </main><footer class="site-footer h-card">
+  <data class="u-url" href="/"></data>
+
+  <div class="wrapper">
+
+    <h2 class="footer-heading">Slow and Fast</h2>
+
+    <div class="footer-col-wrapper">
+      <div class="footer-col footer-col-1">
+        <ul class="contact-list">
+          <li class="p-name">Slow and Fast</li><li><a class="u-email" href="mailto:francisco_flynn@foxmail.com">francisco_flynn@foxmail.com</a></li></ul>
+      </div>
+
+      <div class="footer-col footer-col-2"><ul class="social-media-list"><li><a href="https://github.com/jekyll"><svg class="svg-icon"><use xlink:href="/assets/minima-social-icons.svg#github"></use></svg> <span class="username">jekyll</span></a></li><li><a href="https://www.twitter.com/jekyllrb"><svg class="svg-icon"><use xlink:href="/assets/minima-social-icons.svg#twitter"></use></svg> <span class="username">jekyllrb</span></a></li></ul>
+</div>
+
+      <div class="footer-col footer-col-3">
+        <p>Slow and fast are couple of relative concepts, i hope to record the fast changing tech(and world) in this slow way.</p>
+      </div>
+    </div>
+
+  </div>
+
+</footer>
+</body>
+
+</html>

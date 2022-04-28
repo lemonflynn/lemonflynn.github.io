@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1"><!-- Begin Jekyll SEO tag v2.7.1 -->
+<title>Timer implementation in QEMU | Slow and Fast</title>
+<meta name="generator" content="Jekyll v3.9.0" />
+<meta property="og:title" content="Timer implementation in QEMU" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Clock type QEMU中定义了如下四种时钟： QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新 QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新 QEMU_CLOCK_HOST: host时钟，也就是墙上时钟 QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟" />
+<meta property="og:description" content="Clock type QEMU中定义了如下四种时钟： QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新 QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新 QEMU_CLOCK_HOST: host时钟，也就是墙上时钟 QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟" />
+<link rel="canonical" href="http://localhost:4000/virtualization/2021/11/15/qemu-timer.html" />
+<meta property="og:url" content="http://localhost:4000/virtualization/2021/11/15/qemu-timer.html" />
+<meta property="og:site_name" content="Slow and Fast" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2021-11-15T20:20:16+08:00" />
+<meta name="twitter:card" content="summary" />
+<meta property="twitter:title" content="Timer implementation in QEMU" />
+<script type="application/ld+json">
+{"@type":"BlogPosting","mainEntityOfPage":{"@type":"WebPage","@id":"http://localhost:4000/virtualization/2021/11/15/qemu-timer.html"},"url":"http://localhost:4000/virtualization/2021/11/15/qemu-timer.html","headline":"Timer implementation in QEMU","description":"Clock type QEMU中定义了如下四种时钟： QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新 QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新 QEMU_CLOCK_HOST: host时钟，也就是墙上时钟 QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟","dateModified":"2021-11-15T20:20:16+08:00","datePublished":"2021-11-15T20:20:16+08:00","@context":"https://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+<link rel="stylesheet" href="/assets/main.css"><link type="application/atom+xml" rel="alternate" href="http://localhost:4000/feed.xml" title="Slow and Fast" /></head>
+<body><header class="site-header" role="banner">
+
+  <div class="wrapper"><a class="site-title" rel="author" href="/">Slow and Fast</a><nav class="site-nav">
+        <input type="checkbox" id="nav-trigger" class="nav-trigger" />
+        <label for="nav-trigger">
+          <span class="menu-icon">
+            <svg viewBox="0 0 18 15" width="18px" height="15px">
+              <path d="M18,1.484c0,0.82-0.665,1.484-1.484,1.484H1.484C0.665,2.969,0,2.304,0,1.484l0,0C0,0.665,0.665,0,1.484,0 h15.032C17.335,0,18,0.665,18,1.484L18,1.484z M18,7.516C18,8.335,17.335,9,16.516,9H1.484C0.665,9,0,8.335,0,7.516l0,0 c0-0.82,0.665-1.484,1.484-1.484h15.032C17.335,6.031,18,6.696,18,7.516L18,7.516z M18,13.516C18,14.335,17.335,15,16.516,15H1.484 C0.665,15,0,14.335,0,13.516l0,0c0-0.82,0.665-1.483,1.484-1.483h15.032C17.335,12.031,18,12.695,18,13.516L18,13.516z"/>
+            </svg>
+          </span>
+        </label>
+
+        <div class="trigger"><a class="page-link" href="/about/">About</a></div>
+      </nav></div>
+</header>
+<main class="page-content" aria-label="Content">
+      <div class="wrapper">
+        <article class="post h-entry" itemscope itemtype="http://schema.org/BlogPosting">
+
+  <header class="post-header">
+    <h1 class="post-title p-name" itemprop="name headline">Timer implementation in QEMU</h1>
+    <p class="post-meta">
+      <time class="dt-published" datetime="2021-11-15T20:20:16+08:00" itemprop="datePublished">Nov 15, 2021
+      </time></p>
+  </header>
+
+  <div class="post-content e-content" itemprop="articleBody">
+    <h2 id="clock-type">Clock type</h2>
+<p>QEMU中定义了如下四种时钟：</p>
+<ol>
+  <li>QEMU_CLOCK_REALTIME: 真实时钟，即使vcpu暂停运行，时钟继续更新</li>
+  <li>QEMU_CLOCK_VIRTUAL: 虚拟时钟，如果vm暂停了，该时钟也不更新</li>
+  <li>QEMU_CLOCK_HOST: host时钟，也就是墙上时钟</li>
+  <li>QEMU_CLOCK_VIRTUAL_RT: 根据instruction counter来更新时钟，如果使用了硬件加速，则等同于虚拟时钟</li>
+</ol>
+
+<h2 id="相关数据结构">相关数据结构</h2>
+<p><img src="/assets/qemu/qemu_timer.png" alt="1" /></p>
+
+<p>如上图所示，QEMU定义了一个包含４类QEMUClock的qemu_clocks数组，同时QEMU会创建类型为QEMUTimeListGroup的全局变量main_loop_tlg, 这个变量用来管理使用<em>timer_new_ms</em>注册的不同时钟类型的定时器，同时针对每一个的AioContext,其中也有一个QEMUTimeListGroup类型的成员变量tlg，用来管理使用<em>aio_timer_new</em>注册的定时器。新建的定时器用QEMUTimer代表，根据其截止时间排序后插入指定时钟类型的QEMUTimelist中的active_timer链表中。</p>
+
+<p>当某一类型的lock发生状态变化时（使能或失能，溢出等）， QEMU会调用QEMUClock挂在链表timerlist中的所有QEMUTimeListGroup的notify_cb函数。</p>
+
+<h2 id="更新机制">更新机制</h2>
+<p>对于使用<em>timer_new_ms</em>注册的定时器，QEMU在main_loop_wait中调用qemu_clock_run_all_timers来处理定时器。 对于使用<em>aio_timer_new</em>注册的定时器，则在aio_ctx_dispatch阶段使用timerlistgroup_run_timers来处理。处理步骤也很简单，根据当前时间判断，依次调用定时器链表中所有满足截止时间的定时器的callback函数。</p>
+
+<h2 id="备注">备注</h2>
+<p><img src="/assets/qemu/qemu_timer2.png" alt="2" /></p>
+
+<p>所以在QEMU中注册的所有定时器中，假如有两个定时器的截止时间是一样的，他们也不是同时执行，而是有先后顺序的。所以定时器中不能做耗时长的操作，否则会影响其他定时器的准时执行。</p>
+
+  </div><a class="u-url" href="/virtualization/2021/11/15/qemu-timer.html" hidden></a>
+</article>
+
+      </div>
+    </main><footer class="site-footer h-card">
+  <data class="u-url" href="/"></data>
+
+  <div class="wrapper">
+
+    <h2 class="footer-heading">Slow and Fast</h2>
+
+    <div class="footer-col-wrapper">
+      <div class="footer-col footer-col-1">
+        <ul class="contact-list">
+          <li class="p-name">Slow and Fast</li><li><a class="u-email" href="mailto:francisco_flynn@foxmail.com">francisco_flynn@foxmail.com</a></li></ul>
+      </div>
+
+      <div class="footer-col footer-col-2"><ul class="social-media-list"><li><a href="https://github.com/jekyll"><svg class="svg-icon"><use xlink:href="/assets/minima-social-icons.svg#github"></use></svg> <span class="username">jekyll</span></a></li><li><a href="https://www.twitter.com/jekyllrb"><svg class="svg-icon"><use xlink:href="/assets/minima-social-icons.svg#twitter"></use></svg> <span class="username">jekyllrb</span></a></li></ul>
+</div>
+
+      <div class="footer-col footer-col-3">
+        <p>Slow and fast are couple of relative concepts, i hope to record the fast changing tech(and world) in this slow way.</p>
+      </div>
+    </div>
+
+  </div>
+
+</footer>
+</body>
+
+</html>
