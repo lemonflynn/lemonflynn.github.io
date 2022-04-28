@@ -2,7 +2,7 @@
 layout: post
 title:  "kvm ioeventfd"
 date:   2022-4-28 20:20:16 +0800
-categories: Tech 
+categories: kernel
 ---
 
 ioeventfd的设计初衷是为了减少heavy-weight的vmexit，适用于当vm操作的PIO/MMIO只是当成一个信号用来控制其他的设备模拟逻辑。
@@ -12,10 +12,10 @@ struct _ioeventfd {
     struct list_head     list;
     u64                  addr;
     int                  length;
-    struct eventfd_ctx  *eventfd;                                                                                                                        
+    struct eventfd_ctx  *eventfd;
     u64                  datamatch;
-    struct kvm_io_device dev; 
-    bool                 wildcard;     
+    struct kvm_io_device dev;
+    bool                 wildcard;
 };
 ```
 
@@ -34,3 +34,5 @@ ioeventfd_write(struct kvm_io_device *this, gpa_t addr, int len,
 }
 ```
 ioeventfd_in_range用来判断产生vmexit的addr是否可以由这个kvm_io_device处理，如果可以，则使用eventfd_signal来通知应用层。
+
+[KVM: add ioeventfd support](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=d34e6b175e61821026893ec5298cc8e7558df43a)

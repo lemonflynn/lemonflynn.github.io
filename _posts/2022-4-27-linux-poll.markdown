@@ -2,7 +2,7 @@
 layout: post
 title:  "poll implementation"
 date:   2022-4-27 20:20:16 +0800
-categories: Tech 
+categories: kernel
 ---
 
 在用户层调用poll后，内核使用do_sys_poll来处理需要poll的fds，主要过程如下：
