@@ -10,7 +10,7 @@ PCI（PCIE）设备在PC架构中有着举足轻重的地位，了解PCI总线�
 
 # 回顾PCI 设备与总线
 
-<img src="../assets/qemu/pci1.png" width="800" height="800">
+<img src="/assets/qemu/pci1.png" width="800" height="800">
 
 上图是比较经典的PC架构图，从上图中可以看到CPU之间通过interchip bus连接，然后和I440FX芯片连接，I440FX就是我们熟知的北桥芯片组，用来连接高速外设和南桥芯片组，高速外设包括内存、显卡和网卡等，南桥芯片组（PIIX4）用来连接各种低速或老旧的外设。当然，最新的PC架构已经没有这么严格的划分出南桥和北桥芯片了。
 
