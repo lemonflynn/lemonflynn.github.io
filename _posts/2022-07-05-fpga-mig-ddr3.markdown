@@ -57,6 +57,7 @@ For write data that is output after the write command has been registered, as sh
 
 ![1](/assets/fpga/mig_3.png)
 
+![1](/assets/fpga/mig_8.png)
 
 # Read Path
 

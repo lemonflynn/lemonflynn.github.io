@@ -10,11 +10,11 @@ PCI（PCIE）设备在PC架构中有着举足轻重的地位，了解PCI总线�
 
 # 回顾PCI 设备与总线
 
-<img src="https://img-blog.csdnimg.cn/20200220141544158.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="50%" />
+<img src="../assets/qemu/pci1.png" width="800" height="800">
 
 上图是比较经典的PC架构图，从上图中可以看到CPU之间通过interchip bus连接，然后和I440FX芯片连接，I440FX就是我们熟知的北桥芯片组，用来连接高速外设和南桥芯片组，高速外设包括内存、显卡和网卡等，南桥芯片组（PIIX4）用来连接各种低速或老旧的外设。当然，最新的PC架构已经没有这么严格的划分出南桥和北桥芯片了。
 
-<img src="https://img-blog.csdnimg.cn/20200220145054498.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="50%" />
+<img src="../assets/qemu/pci2.png" width="800" height="600">
 
 CPU可以直接通过load/store指令来访问PCI设备，*PCI设备有如下三种不同内存*：
 
@@ -22,17 +22,17 @@ CPU可以直接通过load/store指令来访问PCI设备，*PCI设备有如下三
 - PCI IO space
 - PCI configuration space
 
-<img src="https://img-blog.csdnimg.cn/20200220145643467.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="70%" />
+<img src="../assets/qemu/pci3.png" width="700" height="600">
 
 PCI configuration space
 
-<img src="https://img-blog.csdnimg.cn/20200221132251526.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="50%" />
+<img src="../assets/qemu/pci4.png" width="800" height="800">
 
 pci configuration space 是用来配置pci设备的，其中也包含了关于pci设备的特定信息。其中
 **BAR: Base address register**可以用来确定设备需要使用的内存或I/O空间的大小，也可以
 用来存放设备寄存器的地址。有两种类型的bar，其格式如下：
 
-<img src="https://img-blog.csdnimg.cn/20200221133009741.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="50%" />
+<img src="../assets/qemu/pci5.png" width="600" height="300">
 
 PCI总线上的流量分为两种：
 - Command traffic
@@ -43,15 +43,15 @@ TBD
 # QEMU中PCI总线的初始化流程
 首先来看一下，qemu虚拟的pci设备有哪些：
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200220162918191.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci6.png)
 
 可以看出，PCI设备0:0.0是pci host bridge，PCI设备0:1.0是ISA bridge，PCI设备0:1.1是IDE控制器，PCI设备0:2.0是VGA设备，PCI设备0:3.0是网卡设备。结合下图，可以看出，pci.0总线是挂在main-system-bus下的，而main-system-bus是根总线，一切所有的设备最终都可以通过各种bus追溯到根总线。
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200220163857939.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci7.png)
 
 可以查看一下虚拟机中的pci设备信息如下：
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200221135952413.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci8.png)
 
 00:02.0是VGA设备，由于PCI是小尾端，所以其bar0的值是0xfd000008，和我们从qemu中看到的0xfd000000只有第3位不同，而第三位置1表示该段内存是prefetchable的。
 
@@ -138,7 +138,7 @@ int pci_bar(PCIDevice *d, int reg)
 ```
 此时调用了pci_register_bar之后，假设这个bar是I/O space类型的，且大小为0x10，则该bar的值为0xFFFF_FFF1, 此时bar中还没有真正可用的地址。那地址是信息是什么是很被写进bar中的呢，以及bar所表示的内存区域是何时完成映射的？答案如下：
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/2020022115562425.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci9.png)
 
 在qemu创建好所有的虚拟设备后，需要调用qemu_system_reset来复位系统，从main-system-bus开始递归遍历调用每个挂在总线上的设备注册的复位函数，其中pci设备会调用pci_do_device_reset，该函数清空PCI_COMMAND和PCI_STATUAS寄存器，清空cache_line和中断引脚配置，最后调用pci_update_mapping，从该函数的名字也可判断，此时是更新内存映射，如下：
 
@@ -196,11 +196,11 @@ static void pci_update_mappings(PCIDevice *d)
 ```
 当然，此时bar中也有可能是还没有可用的地址信息的，我们在**if (r->addr != PCI_BAR_UNMAPPED)**这一行打断点，其调用堆栈如下：
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200308163810595.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci10.png)
 
 此时由于虚拟机有对3324的I/O口进行了写操作，所以发生了vm-exit，之后由kvm接管，kvm发现自己不能处理这个I/O操作后，控制权从kvm内核模块返回到qemu，qemu最终调用该端口注册的回调函数，即pci_host_config_write_common。那这个端口是干什么用的呢，3324端口即0xCFC，是CONFIG_DATA端口，它和0xCF8即CONFIG_ADDRESS端口配合使用，用来读写pci设备的configuration space。
 
-<img src="https://img-blog.csdnimg.cn/20200222151808462.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="50%" />
+<img src="../assets/qemu/pci11.png" width="800">
 
 例如操作系统会用如下方式来读pci设备的配置空间：
 ```c
@@ -291,15 +291,15 @@ const MemoryRegionOps pci_host_data_le_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 ```
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200308163644789.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+![1](/assets/qemu/pci12.png)
 
 我们可以从这个memory region得到opaque地址，而这个opaque对应的是PCIHostState数据结构，从而可以得到config_reg值为0x80000904，这个按如下方式解析：
 
-<img src="https://img-blog.csdnimg.cn/20200308164116747.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70" width="70%" />
+<img src="../assets/qemu/pci13.png" width="800">
 
 所以此次访问的是0:1:1设备的addr为4的寄存器，从qemu的monitor中我们也可以查到该设备是IDE controller，这也与通过gdb得到的pci设备名字一致。地址为4的寄存器是command/status寄存器，写入的值为259，即0x103，command register解析方式如下：
 
-![在这里插入图片描述](https://img-blog.csdnimg.cn/20200308165452466.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80Mzc4MDI2MA==,size_16,color_FFFFFF,t_70)
+<img src="../assets/qemu/pci14.png" width="800">
 
 所以表示使能SERR驱动，响应memory space和I/O space访问。虚拟机驱动代码首先设置好所有pci设备的command register为0x103，接着开始通过这种方式更新各个设备中的BAR值。
 
