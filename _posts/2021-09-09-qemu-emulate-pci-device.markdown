@@ -14,7 +14,7 @@ PCI（PCIE）设备在PC架构中有着举足轻重的地位，了解PCI总线�
 
 上图是比较经典的PC架构图，从上图中可以看到CPU之间通过interchip bus连接，然后和I440FX芯片连接，I440FX就是我们熟知的北桥芯片组，用来连接高速外设和南桥芯片组，高速外设包括内存、显卡和网卡等，南桥芯片组（PIIX4）用来连接各种低速或老旧的外设。当然，最新的PC架构已经没有这么严格的划分出南桥和北桥芯片了。
 
-<img src="../assets/qemu/pci2.png" width="800" height="600">
+<img src="/assets/qemu/pci2.png" width="800" height="600">
 
 CPU可以直接通过load/store指令来访问PCI设备，*PCI设备有如下三种不同内存*：
 
@@ -22,17 +22,17 @@ CPU可以直接通过load/store指令来访问PCI设备，*PCI设备有如下三
 - PCI IO space
 - PCI configuration space
 
-<img src="../assets/qemu/pci3.png" width="700" height="600">
+<img src="/assets/qemu/pci3.png" width="700" height="600">
 
 PCI configuration space
 
-<img src="../assets/qemu/pci4.png" width="800" height="800">
+<img src="/assets/qemu/pci4.png" width="800" height="800">
 
 pci configuration space 是用来配置pci设备的，其中也包含了关于pci设备的特定信息。其中
 **BAR: Base address register**可以用来确定设备需要使用的内存或I/O空间的大小，也可以
 用来存放设备寄存器的地址。有两种类型的bar，其格式如下：
 
-<img src="../assets/qemu/pci5.png" width="600" height="300">
+<img src="/assets/qemu/pci5.png" width="600" height="300">
 
 PCI总线上的流量分为两种：
 - Command traffic
@@ -200,7 +200,7 @@ static void pci_update_mappings(PCIDevice *d)
 
 此时由于虚拟机有对3324的I/O口进行了写操作，所以发生了vm-exit，之后由kvm接管，kvm发现自己不能处理这个I/O操作后，控制权从kvm内核模块返回到qemu，qemu最终调用该端口注册的回调函数，即pci_host_config_write_common。那这个端口是干什么用的呢，3324端口即0xCFC，是CONFIG_DATA端口，它和0xCF8即CONFIG_ADDRESS端口配合使用，用来读写pci设备的configuration space。
 
-<img src="../assets/qemu/pci11.png" width="800">
+<img src="/assets/qemu/pci11.png" width="800">
 
 例如操作系统会用如下方式来读pci设备的配置空间：
 ```c
@@ -295,11 +295,11 @@ const MemoryRegionOps pci_host_data_le_ops = {
 
 我们可以从这个memory region得到opaque地址，而这个opaque对应的是PCIHostState数据结构，从而可以得到config_reg值为0x80000904，这个按如下方式解析：
 
-<img src="../assets/qemu/pci13.png" width="800">
+<img src="/assets/qemu/pci13.png" width="800">
 
 所以此次访问的是0:1:1设备的addr为4的寄存器，从qemu的monitor中我们也可以查到该设备是IDE controller，这也与通过gdb得到的pci设备名字一致。地址为4的寄存器是command/status寄存器，写入的值为259，即0x103，command register解析方式如下：
 
-<img src="../assets/qemu/pci14.png" width="800">
+<img src="/assets/qemu/pci14.png" width="800">
 
 所以表示使能SERR驱动，响应memory space和I/O space访问。虚拟机驱动代码首先设置好所有pci设备的command register为0x103，接着开始通过这种方式更新各个设备中的BAR值。
 
