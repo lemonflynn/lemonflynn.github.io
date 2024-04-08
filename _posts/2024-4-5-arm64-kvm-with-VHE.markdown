@@ -46,7 +46,7 @@ However, this rediretion lead to a new problem, A hypervisor still needs to acce
 
 All these changes could allow the host kernel to run at EL2 with very little effort, only have to modify the early boot code, see below code
 
-```assembly
+```c
 diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
 index 917d981..6f2f377 100644
 --- a/arch/arm64/kernel/head.S
@@ -136,33 +136,33 @@ VHE can also facilitate the redesign of KVM, making it cleaner and simpler, the 
        unsigned long virt_addr;
        unsigned long start = kern_hyp_va((unsigned long)from);
        unsigned long end = kern_hyp_va((unsigned long)to);
-   n o
+
        if (is_kernel_in_hyp_mode())
            return 0;
    ...
    }
    ```
 
-4. host kernel's control transfer to kvm no longer through `hvc`
+4. host kernel's control transfer to kvm no longer through `hvc`.
 
 <img src="/assets/virt/vhe_4.png" alt="vhe_4" style="zoom:50%;" />
 
-1. the hypervisor must be modified to replace all EL1 access instructions that should continue to access VM's EL1 register with the new xxx_EL12 access instructions when using VHE.
+5. the hypervisor must be modified to replace all EL1 access instructions that should continue to access VM's EL1 register with the new xxx_EL12 access instructions when using VHE.
 
    ```c
-   +#define read_sysreg_elx(r,nvh,vh)					\
-   +	({								\
-   +		u64 reg;						\
-   +		asm volatile(ALTERNATIVE("mrs %0, " __stringify(r##nvh),\
-   +					 "mrs_s %0, " __stringify(r##vh),\
-   +					 ARM64_HAS_VIRT_HOST_EXTN)	\
-   +			     : "=r" (reg));				\
-   +		reg;							\
-   +	})
-   +#define read_sysreg_el0(r)	read_sysreg_elx(r, _EL0, _EL02)
-   +#define write_sysreg_el0(v,r)	write_sysreg_elx(v, r, _EL0, _EL02)
-   +#define read_sysreg_el1(r)	read_sysreg_elx(r, _EL1, _EL12)
-   +#define write_sysreg_el1(v,r)	write_sysreg_elx(v, r, _EL1, _EL12)
+   #define read_sysreg_elx(r,nvh,vh)					\
+   	({								\
+   		u64 reg;						\
+   		asm volatile(ALTERNATIVE("mrs %0, " __stringify(r##nvh),\
+   		                        "mrs_s %0, " __stringify(r##vh),\
+   		                            ARM64_HAS_VIRT_HOST_EXTN)	\
+   		                            : "=r" (reg));				\
+   		reg;							\
+   	})
+   #define read_sysreg_el0(r)	read_sysreg_elx(r, _EL0, _EL02)
+   #define write_sysreg_el0(v,r)	write_sysreg_elx(v, r, _EL0, _EL02)
+   #define read_sysreg_el1(r)	read_sysreg_elx(r, _EL1, _EL12)
+   #define write_sysreg_el1(v,r)	write_sysreg_elx(v, r, _EL1, _EL12)
    ```
 
 ## Reference
@@ -170,3 +170,5 @@ VHE can also facilitate the redesign of KVM, making it cleaner and simpler, the 
 1. [Optimizing the Design and Implementation of the Linux ARM Hypervisor](https://www.usenix.org/system/files/conference/atc17/atc17-dall.pdf)
 
 2. [arm64: VHE: Add support for running Linux in EL2 mode](https://patchwork.kernel.org/project/kvm/patch/1454522416-6874-23-git-send-email-marc.zyngier@arm.com/)
+
+3. [Learn the architecture - AArch64 virtualization](https://developer.arm.com/documentation/102142/0100/Virtualization-host-extensions)
