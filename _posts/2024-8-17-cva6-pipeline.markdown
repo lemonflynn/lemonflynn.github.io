@@ -105,7 +105,7 @@ logic [NR_SB_ENTRIES+NrWbPorts-1:0][XLEN-1:0] rs_data
 
 对于 rs1_fwd_req, rs2_fwd_req, rs3_fwd_req，构建过程分为两部分
 
-a. 遍历 write_back ports，根据每个 write back 信号的 transaction ID 得到对应 sbe，判断 sbe.rd 是否等于 rs，以及 write_back 信号是否有效，write_back 没有异常产生，要更新的寄存器是否类型一致，如果满足条件，设置对应 req 为 1，以及设置对应的 `rs_data = wbdata_i`
+a. 遍历 write_back ports，根据每个 write back 信号的 transaction ID 得到 mem_q[trans_id].sbe，判断 sbe.rd 是否等于 rs，以及 write_back 信号是否有效，write_back 没有异常产生，要更新的寄存器是否类型一致，如果满足条件，设置 req1_fwd_req[trans_id] = 1，以及设置 `rs_data[trans_id] = wbdata_i`
 
 b. 遍历所有 sbe entry，判断  `(mem_q[k].sbe.rd == rs1_i) & mem_q[k].issued & mem_q[k].sbe.valid` 且要更新的寄存器是否类型一致，如果满足条件，设置 req1_fwd_req[k] = 1。
 
