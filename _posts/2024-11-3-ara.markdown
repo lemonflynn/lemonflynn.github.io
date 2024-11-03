@@ -19,34 +19,35 @@ ara 是一个实现了 risc-v vector 指令集的协处理器。在 CVA6 处理�
 **hardware/include/ara_pkg.sv**
 
 ```  verilog
-  // Maximum size of a single vector element, in bits.
-  // Ara only supports vector elements up to 64 bits.
-  localparam int unsigned ELEN  = 64;
-  // Maximum size of a single vector element, in bytes.
-  localparam int unsigned ELENB = ELEN / 8;
+// Maximum size of a single vector element, in bits.                                                                                                                                     
+// Ara only supports vector elements up to 64 bits.
+localparam int unsigned ELEN  = 64;
+// Maximum size of a single vector element, in bytes.
+localparam int unsigned ELENB = ELEN / 8;
 
-  // Number of vector instructions that can run in parallel.
-  localparam int unsigned NrVInsn = 8;                                                                                           
-  // Maximum number of lanes that Ara can support.
-  localparam int unsigned MaxNrLanes = 16;
+// Number of vector instructions that can run in parallel.
+localparam int unsigned NrVInsn = 8;                                                                                             
+// Maximum number of lanes that Ara can support.
+localparam int unsigned MaxNrLanes = 16;
 
-  ////////////////////////
-  //  Lane definitions  //
-  ////////////////////////
+////////////////////////
+//  Lane definitions  //
+////////////////////////
 
-  // There are seven operand queues, serving operands to the different functional units of each lane
-  localparam int unsigned NrOperandQueues = 9;                    typedef enum logic [$clog2(NrOperandQueues)-1:0] {
-    AluA, AluB, MulFPUA, MulFPUB, MulFPUC, MaskB, MaskM, StA, SlideAddrGenA
-  } opqueue_e;
+// There are seven operand queues, serving operands to the different functional units of each lane
+localparam int unsigned NrOperandQueues = 9;
+typedef enum logic [$clog2(NrOperandQueues)-1:0] { 
+  AluA, AluB, MulFPUA, MulFPUB, MulFPUC, MaskB, MaskM, StA, SlideAddrGenA
+} opqueue_e;
 
-  // Each lane has eight VRF banks
-  // NOTE: values != 8 are not supported
-  localparam int unsigned NrVRFBanksPerLane = 8;
+// Each lane has eight VRF banks
+// NOTE: values != 8 are not supported
+localparam int unsigned NrVRFBanksPerLane = 8;
 
-  localparam int unsigned MaxVLenPerLane  = VLEN / NrLanes;       // In bits
-  localparam int unsigned MaxVLenBPerLane = VLENB / NrLanes;      // In bytes
-  localparam int unsigned VRFSizePerLane  = MaxVLenPerLane * 32;  // In bits
-  localparam int unsigned VRFBSizePerLane = MaxVLenBPerLane * 32; // In bytes
+localparam int unsigned MaxVLenPerLane  = VLEN / NrLanes;       // In bits
+localparam int unsigned MaxVLenBPerLane = VLENB / NrLanes;      // In bytes
+localparam int unsigned VRFSizePerLane  = MaxVLenPerLane * 32;  // In bits
+localparam int unsigned VRFBSizePerLane = MaxVLenBPerLane * 32; // In bytes
 
 // Maximum size of a single vector element, in bits.
 // Ara only supports vector elements up to 64 bits.
@@ -411,33 +412,32 @@ Operand requester 的作用是将每个 queue 中的 operand_request 转换成�
 
 其处理逻辑如下：
 
-1. 如果此时状态为 IDLE 且 operand_request 有效
-
+1.如果此时状态为 IDLE 且 operand_request 有效
    -  ack 这个请求，设置 next_state 为 REQUESTING
    - 生成 operand_queue_cmd，设置 operand_queue_cmd_valid_o = 1
    - 保存 requester_metadata_d 用来控制后续的 VRF 请求
 
-   ```verilog
-   // Address of the vstart element of the vector in the VRF                                 // This vstart is NOT the architectural one and was modified in the lane
-   // sequencer to provide the correct start address
-   vrf_addr = vaddr(operand_request_i[requester_index].vs, NrLanes, VLEN) 
-            + (operand_request_i[requester_index].vstart >>
-                (unsigned'(EW64) - unsigned'(operand_request_i[requester_index].eew)));
-   // Init helper variables
-   requester_metadata_tmp = '{
-     id          : operand_request_i[requester_index].id,
-     addr        : vrf_addr,
-     len         : effective_vector_body_length,
-     vew         : operand_request_i[requester_index].eew,
-     hazard      : operand_request_i[requester_index].hazard,
-     is_widening : operand_request_i[requester_index].cvt_resize == CVT_WIDE,
-     default: '0
-   };
-   ```
+```verilog
+// Address of the vstart element of the vector in the VRF                                 // This vstart is NOT the architectural one and was modified in the lane
+// sequencer to provide the correct start address
+vrf_addr = vaddr(operand_request_i[requester_index].vs, NrLanes, VLEN) 
+        + (operand_request_i[requester_index].vstart >>
+            (unsigned'(EW64) - unsigned'(operand_request_i[requester_index].eew)));
+// Init helper variables
+requester_metadata_tmp = '{
+    id          : operand_request_i[requester_index].id,
+    addr        : vrf_addr,
+    len         : effective_vector_body_length,
+    vew         : operand_request_i[requester_index].eew,
+    hazard      : operand_request_i[requester_index].hazard,
+    is_widening : operand_request_i[requester_index].cvt_resize == CVT_WIDE,
+    default: '0
+};
+```
 
-2. 由于 VRF 由多个 bank 组成，且每个 vector register 分布在不同的 bank 上，所以，要获取一个 vector register 的数据，就需要依次向不同的 bank 发出读请求。从 VRF 的设计来看，可以同时从 8 个 bank 读数据，并放到 8 个 operand queue 中，但是没办法一次从 8 个 bank 中读取数据，放到一个 operand queue 中。也就是说，如果一个 vector register 由 8 个 bank 构成，那就需要分 8 次请求才能读完所需数据。
+2.由于 VRF 由多个 bank 组成，且每个 vector register 分布在不同的 bank 上，所以，要获取一个 vector register 的数据，就需要依次向不同的 bank 发出读请求。从 VRF 的设计来看，可以同时从 8 个 bank 读数据，并放到 8 个 operand queue 中，但是没办法一次从 8 个 bank 中读取数据，放到一个 operand queue 中。也就是说，如果一个 vector register 由 8 个 bank 构成，那就需要分 8 次请求才能读完所需数据。
 
-   如果此时状态为 REQUESTING， 且 Operand queue 中的数据队列没有满，则构造 operand_payload，payload 最终会从 VRF 中的某个 bank 中读数据，其中 opqueue 表示此次从 addr 读取的 64 bit 数据要存放到哪个 operand queue 中， 如果 operand_requester_gnt 有效，表示仲裁器已经将 requester_index 的 operand_req 发送给了 VRF，可以更新 requester_metadata_d 中的 addr 和 len 信息，生成下个的 operand_req，如果 len = 0，表示此次请求已完成，状态设置为 IDLE
+如果此时状态为 REQUESTING， 且 Operand queue 中的数据队列没有满，则构造 operand_payload，payload 最终会从 VRF 中的某个 bank 中读数据，其中 opqueue 表示此次从 addr 读取的 64 bit 数据要存放到哪个 operand queue 中， 如果 operand_requester_gnt 有效，表示仲裁器已经将 requester_index 的 operand_req 发送给了 VRF，可以更新 requester_metadata_d 中的 addr 和 len 信息，生成下个的 operand_req，如果 len = 0，表示此次请求已完成，状态设置为 IDLE
 
 ```verilog
 // Bank we are currently requesting
@@ -534,47 +534,46 @@ end
 - 第一个仲裁器处理高优先级的 req，需要仲裁的 req 包括 VFU 所需的 `AluA, AluB, MulFPUA, MulFPUB, MulFPUC` 这几个 queue 的 read req 以及 VFU_Alu 和 VFU_MFpu 的 write-back queue 的 write req
 
 ```verilog
-    rr_arb_tree #(
-      .NumIn    (unsigned'(MulFPUC) - unsigned'(AluA) + 1 + unsigned'(VFU_MFpu) - unsigned'(VFU_Alu) + 1),
-      .DataWidth($bits(payload_t)                                                   ),
-      .AxiVldRdy(1'b0                                                               )
-    ) i_hp_vrf_arbiter (
-      .clk_i  (clk_i ),
-      .rst_ni (rst_ni),
-      .flush_i(1'b0  ),
-      .rr_i   ('0    ),
-      .data_i ({operand_payload[MulFPUC:AluA],
-          operand_payload[NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]} ),
-      .req_i ({operand_req[bank][MulFPUC:AluA],
-          operand_req[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
-      .gnt_o ({operand_gnt[bank][MulFPUC:AluA],
-          operand_gnt[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
-      .data_o (payload_hp    ),
-      .idx_o  (/* Unused */  ),
-      .req_o  (payload_hp_req),
-      .gnt_i  (payload_hp_gnt)
-    );
-
+rr_arb_tree #(
+  .NumIn    (unsigned'(MulFPUC) - unsigned'(AluA) + 1 + unsigned'(VFU_MFpu) - unsigned'(VFU_Alu) + 1), 
+  .DataWidth($bits(payload_t)                                                   ),  
+  .AxiVldRdy(1'b0                                                               )   
+) i_hp_vrf_arbiter (
+  .clk_i  (clk_i ),
+  .rst_ni (rst_ni),
+  .flush_i(1'b0  ),  
+  .rr_i   ('0    ),  
+  .data_i ({operand_payload[MulFPUC:AluA],
+      operand_payload[NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]} ),
+  .req_i ({operand_req[bank][MulFPUC:AluA],
+      operand_req[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
+  .gnt_o ({operand_gnt[bank][MulFPUC:AluA],
+      operand_gnt[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
+  .data_o (payload_hp    ),  
+  .idx_o  (/* Unused */  ),  
+  .req_o  (payload_hp_req),
+  .gnt_i  (payload_hp_gnt)
+);
 ```
 - 第二个仲裁器处理低优先级的 req，包括 MaskB, MaskM, StA, SlideAddrGenA 这些 queue 的 read-req，以及 `VFU_SlideUnit, VFU_MaskUnit, VFU_LoadUnit` 的 write-req
 
 - 第三个仲裁器用来从 payload_hp_req 和 payload_lp_req 中选出最终的 vrf_req_o，送给 VRF
 
 ```verilog
-    rr_arb_tree #(
-      .NumIn    (2               ),
-      .DataWidth($bits(payload_t)),
-      .AxiVldRdy(1'b0            ),
-      .ExtPrio  (1'b1            )
-    ) i_vrf_arbiter (
+rr_arb_tree #(
+  .NumIn    (2               ),
+  .DataWidth($bits(payload_t)),
+  .AxiVldRdy(1'b0            ),
+  .ExtPrio  (1'b1            )                                                                                                                                                           
+) i_vrf_arbiter (
 ...
-      .data_i ({payload_lp, payload_hp}         ),
-      .req_i  ({payload_lp_req, payload_hp_req} ),
-      .gnt_o  ({payload_lp_gnt, payload_hp_gnt} ),
-      .data_o ({vrf_addr_o[bank], vrf_wen_o[bank], vrf_wdata_o[bank], vrf_be_o[bank], vrf_tgt_opqueue_o[bank]}),
-      .req_o (vrf_req_o[bank] ),
-      .gnt_i (vrf_req_o[bank] ) // Acknowledge it directly
-    );
+  .data_i ({payload_lp, payload_hp}         ),
+  .req_i  ({payload_lp_req, payload_hp_req} ),
+  .gnt_o  ({payload_lp_gnt, payload_hp_gnt} ),
+  .data_o ({vrf_addr_o[bank], vrf_wen_o[bank], vrf_wdata_o[bank], vrf_be_o[bank], vrf_tgt_opqueue_o[bank]}),
+  .req_o (vrf_req_o[bank] ),
+  .gnt_i (vrf_req_o[bank] ) // Acknowledge it directly
+);
 ```
 
 ## Operand Queue
