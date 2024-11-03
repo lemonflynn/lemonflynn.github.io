@@ -1,0 +1,744 @@
+---
+layout: post
+title:  "Ara co-processor 分析"
+date:   2024-11-3 9:00:16 +0800
+categories: kernel 
+---
+**作者: flynn**
+
+
+
+![image-20241026183159928](/assets/fpga/ara1.png)
+
+ara 是一个实现了 risc-v vector 指令集的协处理器。在 CVA6 处理器的基础上，需要修改指令解码，和在指令执行阶段，增加一个加速器指令分发的执行单元，来运行 vector 指令。本文主要分析，协处理器是如何 vector 指令的。
+
+# config parameters
+
+下面是一些重要的参数定义。
+
+**hardware/include/ara_pkg.sv**
+
+```  verilog
+  // Maximum size of a single vector element, in bits.
+  // Ara only supports vector elements up to 64 bits.
+  localparam int unsigned ELEN  = 64;
+  // Maximum size of a single vector element, in bytes.
+  localparam int unsigned ELENB = ELEN / 8;
+
+  // Number of vector instructions that can run in parallel.
+  localparam int unsigned NrVInsn = 8;                                                                                           
+  // Maximum number of lanes that Ara can support.
+  localparam int unsigned MaxNrLanes = 16;
+
+  ////////////////////////
+  //  Lane definitions  //
+  ////////////////////////
+
+  // There are seven operand queues, serving operands to the different functional units of each lane
+  localparam int unsigned NrOperandQueues = 9;                    typedef enum logic [$clog2(NrOperandQueues)-1:0] {
+    AluA, AluB, MulFPUA, MulFPUB, MulFPUC, MaskB, MaskM, StA, SlideAddrGenA
+  } opqueue_e;
+
+  // Each lane has eight VRF banks
+  // NOTE: values != 8 are not supported
+  localparam int unsigned NrVRFBanksPerLane = 8;
+
+  localparam int unsigned MaxVLenPerLane  = VLEN / NrLanes;       // In bits
+  localparam int unsigned MaxVLenBPerLane = VLENB / NrLanes;      // In bytes
+  localparam int unsigned VRFSizePerLane  = MaxVLenPerLane * 32;  // In bits
+  localparam int unsigned VRFBSizePerLane = MaxVLenBPerLane * 32; // In bytes
+
+// Maximum size of a single vector element, in bits.
+// Ara only supports vector elements up to 64 bits.
+localparam int unsigned ELEN  = 64
+typedef logic [ELEN-1:0] elen_t
+```
+
+# Dispatcher
+
+TBD.
+
+# Ara Sequencer
+
+sequencer 的作用是处理来自 dispatcher 的 ara_req_t，然后根据当前指令的运行情况，构造 pe_req_t，当条件成熟时，发射到所有 **VFU**(Vector-Function-Unit)中，包括 Vector-Load-Unit, Vector-Store-Unit, Vector-Mask-Unit, Slide-Unit, 以及所有的 lane， pe_req_t 包含了一条 vector 指令解码后的所有信息，结构如下：
+
+```verilog
+typedef struct packed {
+  vid_t id; // ID of the vector instruction
+  ara_op_e op; // Operation
+  // Mask vector register operand
+  logic vm;
+  rvv_pkg::vew_e eew_vmask;
+  vfu_e vfu; // VFU responsible for handling this instruction
+  // Rescale vl taking into account the new and old EEW
+  logic scale_vl;
+  // The lane that provides the first element of the computation
+  logic [$clog2(MaxNrLanes)-1:0] start_lane;
+  // The lane that provides the last element of the computation
+  logic [$clog2(MaxNrLanes)-1:0] end_lane;
+  // 1st vector register operand
+  logic [4:0] vs1;
+  logic use_vs1;
+  opqueue_conversion_e conversion_vs1;
+  rvv_pkg::vew_e eew_vs1;
+  rvv_pkg::vew_e old_eew_vs1;
+  // 2nd vector register operand
+  logic [4:0] vs2;
+  logic use_vs2;
+  opqueue_conversion_e conversion_vs2;
+  rvv_pkg::vew_e eew_vs2;
+  // Use vd as an operand as well (e.g., vmacc)
+  logic use_vd_op;
+  rvv_pkg::vew_e eew_vd_op;
+  // Scalar operand
+  elen_t scalar_op;
+  logic use_scalar_op;
+  // If asserted: vs2 is kept in MulFPU opqueue C, and vd_op in MulFPU A
+  logic swap_vs2_vd_op;
+  // 2nd scalar operand: stride for constant-strided vector load/stores
+  elen_t stride;
+  logic is_stride_np2;
+  // Destination vector register
+  logic [4:0] vd;
+  logic use_vd;
+  // Effective length multiplier
+  rvv_pkg::vlmul_e emul;
+  // Rounding-Mode for FP operations
+  fpnew_pkg::roundmode_e fp_rm;
+  // Widen FP immediate (re-encoding)
+  logic wide_fp_imm;
+  // Resizing of FP conversions
+  resize_e cvt_resize;
+  // Vector machine metadata
+  vlen_t vl;
+  vlen_t vstart;
+  rvv_pkg::vtype_t vtype;
+  // Hazards
+  logic [NrVInsn-1:0] hazard_vs1;
+  logic [NrVInsn-1:0] hazard_vs2;
+  logic [NrVInsn-1:0] hazard_vm;
+  logic [NrVInsn-1:0] hazard_vd;
+} pe_req_t;
+
+typedef struct packed {
+  // Each set bit indicates that the corresponding vector loop has finished execution
+  logic [NrVInsn-1:0] vinsn_done;
+} pe_resp_t;
+```
+
+一般来说，当指令被发射到对应的 VFU 之后就可以响应 dispatcher 了，除非该指令是 load/store 指令或该指令需要将结果写回 scalar 寄存器时，相应的，就需要等待 addr-generator 产生地址后或得到 scalar 值之后才能响应 dispatcher，在此之间，就堵塞来自 dispatcher 的新请求。
+
+## 构造 pe_req
+
+在构造 pe_req_t 时，需要计算如下两种信息：
+
+1. start lane 和 end lane
+2. hazard 信息
+
+start_lane 和 end_lane 根据 vstart, vl 和 vsew 值计算 ，也就是当该 vector instruction 需要计算的 element 没有用满所有的 vector lane ，或者不是从第一个 element 开始计算时，就需要设定不同的 start_lane 和 end_lane，详情可以参考 risc-v vector spec 中的 **Prestart, Active, Inactive, Body and Tail**。
+
+hazard 信息的计算主要依赖于 ara 维护的四个重要结构	如下：
+
+**pe_vinsn_running**：记录了 8 条指令运行时都使用了哪些 VFU，该结构在指令发射时更新，用来计算 vinsn_running。
+
+```verilog
+logic [NrPEs-1:0][NrVInsn-1:0] pe_vinsn_running_d, pe_vinsn_running_q;
+
+// Remember that the vector instruction is running                                           unique case (vfu(ara_req_i.op))
+  VFU_LoadUnit : pe_vinsn_running_d[NrLanes + OffsetLoad][vinsn_id_n]  = 1'b1;          
+  VFU_StoreUnit: pe_vinsn_running_d[NrLanes + OffsetStore][vinsn_id_n] = 1'b1;
+  VFU_SlideUnit: pe_vinsn_running_d[NrLanes + OffsetSlide][vinsn_id_n] = 1'b1;
+  VFU_MaskUnit : pe_vinsn_running_d[NrLanes + OffsetMask][vinsn_id_n]  = 1'b1;
+  VFU_None     : ;
+  default: for (int l = 0; l < NrLanes; l++) 
+      // Instruction is running on the lanes
+      pe_vinsn_running_d[l][vinsn_id_n] = 1'b1;
+endcase
+
+// Masked vector instructions also run on the mask unit 
+pe_vinsn_running_d[NrLanes + OffsetMask][vinsn_id_n] |= !ara_req_i.vm;
+```
+
+根据来自 lane_sequencer 的 pe_req_resp 来判断指令是否运行结束：
+
+```verilog
+// Update the running vector instructions
+for (int pe = 0; pe < NrPEs; pe++) pe_vinsn_running_d[pe] &= ~pe_resp_i[pe].vinsn_done;
+```
+
+<img src="/assets/fpga/ara2.png" alt="image-20241026191113441" style="zoom:40%;" />
+
+**vinsn_running**: 记录哪些指令在运行，可以理解为命令队列（但其实不是），当 vinsn_runing 全为 1 时，则表示 8 条指令都在执行，不能发射新指令，否则根据 lzc（lead zero count）计算出可用的编号来当做下一个指令的 vid。同时该结果用来更新 read_list/write_list。
+
+```verilog
+logic [NrVInsn-1:0] vinsn_running_d, vinsn_running_q;
+
+for (int unsigned pe = 0; pe < NrPEs; pe++) vinsn_running_d |= pe_vinsn_running_d[pe]
+```
+
+**read_list/write_list**：用来标记 vector-register 正在被哪条指令更新，read_list 表示读，write_list 表示写。
+
+<img src="/assets/fpga/ara3.png" alt="image-20241026193552949" style="zoom:25%;" />
+
+在指令发射时，根据 ara_req 中的信息更新该结构体
+
+```verilog
+// Mark that this vector instruction is writing to vector vd
+if (ara_req_i.use_vd) write_list_d[ara_req_i.vd] = '{vid: vinsn_id_n, valid: 1'b1};
+                                                                                       
+// Mark that this loop is reading vs
+if (ara_req_i.use_vs1) read_list_d[ara_req_i.vs1] = '{vid: vinsn_id_n, valid: 1'b1};
+if (ara_req_i.use_vs2) read_list_d[ara_req_i.vs2] = '{vid: vinsn_id_n, valid: 1'b1};
+if (!ara_req_i.vm) read_list_d[VMASK]             = '{vid: vinsn_id_n, valid: 1'b1};
+
+for (int unsigned v = 0; v < 32; v++)
+   read_list_d[v].valid &= vinsn_running_q[read_list_q[v].vid]
+```
+
+**global_hazard_table**，给每个 lane 的 operand requester 使用，具体如何用？更新逻辑如下：
+
+```verilog
+在指令发射时
+// Populate the global hazard table
+global_hazard_table_d[vinsn_id_n] = pe_req_d.hazard_vd  | pe_req_d.hazard_vm |
+                                    pe_req_d.hazard_vs1 | pe_req_d.hazard_vs2;
+
+// Update the global hazard table
+always_comb begin
+for (int id = 0; id < NrVInsn; id++) global_hazard_table_d[id] &= vinsn_running_d;
+end
+```
+
+例如下表中，insn3 依赖于 insn0 和 insn2，
+
+<img src="/assets/fpga/ara4.png" alt="image-20241026194242989" style="zoom:50%;" />
+
+pe_req 中 hazard_vs1,  hazard_vs2, hazard_vm, hazard_vd 的数据类型为 `logic [NrVInsn-1:0]` ，如果 `hazard_vs1[i] = 1` ，则表示 vid 为 i 的指令正在读写 vs1，vs2, vm, vd 类似，其计算逻辑如下：
+
+```verilog
+// RAW，写的有些复杂，但其实很好理解
+if (ara_req_i.use_vs1) pe_req_d.hazard_vs1[write_list_d[ara_req_i.vs1].vid] |=
+  write_list_d[ara_req_i.vs1].valid;
+if (ara_req_i.use_vs2) pe_req_d.hazard_vs2[write_list_d[ara_req_i.vs2].vid] |=
+  write_list_d[ara_req_i.vs2].valid;
+if (!ara_req_i.vm) pe_req_d.hazard_vm[write_list_d[VMASK].vid] |=
+  write_list_d[VMASK].valid;
+// WAR
+if (ara_req_i.use_vd) begin
+  pe_req_d.hazard_vs1[read_list_d[ara_req_i.vd].vid] |= read_list_d[ara_req_i.vd].valid;
+  pe_req_d.hazard_vs2[read_list_d[ara_req_i.vd].vid] |= read_list_d[ara_req_i.vd].valid;
+  pe_req_d.hazard_vm[read_list_d[ara_req_i.vd].vid] |= read_list_d[ara_req_i.vd].valid;
+end
+// WAW
+if (ara_req_i.use_vd) pe_req_d.hazard_vd[write_list_d[ara_req_i.vd].vid] |=
+  write_list_d[ara_req_i.vd].valid;
+```
+
+## 指令发射
+
+那么，如何控制指令是否发射呢？首先每个 VFU 中都有自己的命令队列，可以用来缓存一些指令，各个 VFU 的命令队列深度如下：
+
+```verilog
+localparam int unsigned InsnQueueDepth [NrVFUs] = '{                                           ValuInsnQueueDepth, //4
+    MfpuInsnQueueDepth, //4
+    SlduInsnQueueDepth, //4
+    MaskuInsnQueueDepth,//1
+    VlduInsnQueueDepth, //4
+    VstuInsnQueueDepth, //4
+    NoneInsnQueueDepth  //1
+  };
+```
+
+Dispatcher 为每个 VFU 创建了一个 **counter**，用来记录已经发射的指令个数，控制信号如下：
+
+```verilog
+counter #(           
+        .WIDTH           (CNT_WIDTH),
+) i_insn_queue_cnt (
+        .clk_i           (clk_i                 ),
+        .rst_ni          (rst_ni                ),
+        .en_i            (insn_queue_cnt_en[i]  ),
+        .down_i          (insn_queue_cnt_down[i]),
+        .q_o             (insn_queue_cnt_q[i]   ),
+);
+
+// Each PE is ready only if it can accept a new instruction in the queue
+assign vinsn_queue_ready[i] = insn_queue_cnt_q[i] < InsnQueueDepth[i];
+// Count up on the right counter
+assign insn_queue_cnt_up[i] = accepted_insn & target_vfus_vec[i];
+// Count down if an instruction was consumed by the PE
+assign insn_queue_cnt_down[i] = insn_queue_done[i];
+// Don't count if one instruction is issued and one is consumed
+assign insn_queue_cnt_en[i] = insn_queue_cnt_up[i] ^ insn_queue_cnt_down[i];
+
+assign vinsn_queue_issue[i] = ~target_vfus_vec[i] | (vinsn_queue_ready[i] | priority_pass[i]);
+```
+
+当 counter 中记录的数量  <  VFU 中的命令队列深度时，可以发射新指令到该 VFU。这里还实现了一个 gold_ticket 机制，也就是当 VFU 中的命令队列已满时，按理说不应再增加计数了，但是由于实现机制原因，counter 还是被 + 1，所以此时会给这个 VFU 分配一个 gold ticket，表示可以继续发射指令（可能理解的不对，有机会再分析吧）。
+
+# Lane
+
+lane 的构成框图如下：
+
+<img src="/assets/fpga/ara5.png" alt="image-20241027093038493" style="zoom:50%;" />
+
+主要有以下几个模块构成：
+
+- Lane Sequencer：根据来自 ara sequencer 的请求，控制 Operand Requester 和 Functional Units
+- Operand Requester：向寄存器文件发出读请求，获取指令所需的操作数
+- Vector Resiter File Arbiter: 对 register file 访问可能存在 bank conflict， 使用 round-robin arb 来仲裁
+- VRF：向量寄存器文件，由 8 个单端口读写的 RAM 构成，数据宽度为 64 bit
+- Operand Queue：由于可能存在的 bank conflict 没法一次拿出所需的操作数，需要一个 queue 来缓存操作数，总共有 9 个 queue，queue 的深度就是上一节 ara sequencer 中介绍过的 InsnQueueDepth[NrVFUs]
+- Functional unit：每个 lane 有各自的 VFPU(Vector Floating-point Unit)、VMUL(Vector Multiplier )、VALU(Vector Integer ALU )，共用独立于 lane 的 MASK UNIT、VLSU(Vector Load & Store unit)、SLDU(Slide unit ), 功能单元的 data path 的数据宽度也是 64 bit
+- Write-back Queue：写回操作也有可能引起 bank conflict，把结果先缓存起来，每个功能单元对应一个 queue
+
+## Lane Sequencer
+
+来自 ara sequencer 的请求主要包含以下信息：
+
+- Vector and scalar source operand register numbers
+- Vector functional unit to execute this instruction
+- Mask register number
+- Vector & scalar destination register numbers
+- Effective length multiplier
+- Value of the vector length
+- Value of the vector start
+- Vector type (values from the vtype CSR register)
+- etc.
+
+这里以发射一条 vector alu 指令为例，来观察 lane sequencer 是如何工作的。
+
+1. 使用 `logic [NrVInsn-1:0] vinsn_running_d, vinsn_running_q` 来标记哪条指令正在被执行，初始值为 0。
+2. 根据 VFU 中的 done 信号设置 pe_resp，用来更新 ara_sequencer 中的 score-board
+```verilog
+vinsn_done_d         = alu_vinsn_done_i | mfpu_vinsn_done_i;
+alu_vinsn_done_d     = |alu_vinsn_done_i;
+mfpu_vinsn_done_d    = |mfpu_vinsn_done_i;
+pe_resp_o.vinsn_done = vinsn_done_q;
+```
+3. 根据来自 ara_sequencer 请求中的 VFU，判断此次要运行的指令所用的 Operand queue 是否 ready，如果 ready，则返回 ready 信号给 ara_sequencer；否则 ready = 0；
+```verilog
+if (pe_req_valid) begin
+  unique case (pe_req.vfu)
+    VFU_Alu : begin
+      pe_req_ready = !(operand_request_valid_o[AluA] ||
+        operand_request_valid_o[AluB ] ||
+        operand_request_valid_o[MaskM]);
+    end
+    VFU_MFpu : begin
+...
+```
+4. 如果 `pe_req_valid && pe_req_ready && !vinsn_running_d[pe_req.id]` 则可以发射该指令，根据 pe_req 中的信息，构造 vfu_operation，并设置如下信息
+```verilog
+vfu_operation_valid_d = (vfu_operation_d.vfu != VFU_None) ? 1'b1 : 1'b0;
+vfu_operation_d.vl = pe_req.vl / NrLanes;
+vfu_operation_d.vstart = pe_req.vstart / NrLanes;
+// Mark the vector instruction as running
+vinsn_running_d[pe_req.id] = (vfu_operation_d.vfu != VFU_None) ? 1'b1 : 1'b0;
+```
+同时，构建 operand_request，注意， operand_request 是个长度为 9 的数组，对应 9 个 operand queue
+```verilog
+ unique case (pe_req.vfu)
+        VFU_Alu: begin
+          operand_request[AluA] = '{
+            id         : pe_req.id,
+            vs         : pe_req.vs1,
+            eew        : pe_req.eew_vs1,
+            // If reductions and vl == 0, we must replace with neutral values
+            conv       : (vfu_operation_d.vl == '0) ? OpQueueReductionZExt : pe_req.conversion_vs1,
+            scale_vl   : pe_req.scale_vl,
+            cvt_resize : pe_req.cvt_resize,
+            vtype      : pe_req.vtype,                                                     
+            // In case of reduction, AluA opqueue will keep the scalar element
+            vl         : (pe_req.op inside {[VREDSUM:VWREDSUM]}) ? 1 : vfu_operation_d.vl,
+            vstart     : vfu_operation_d.vstart,
+            hazard     : pe_req.hazard_vs1 | pe_req.hazard_vd,
+            is_reduct  : pe_req.op inside {[VREDSUM:VWREDSUM]} ? 1'b1 : 0,
+            target_fu  : ALU_SLDU,
+            default    : '0
+          };
+          operand_request_push[AluA] = pe_req.use_vs1;
+          //还有 operand_request[AluB] 和 operand_request[MaskM]
+```
+
+## VRF
+
+ara 代码中有一个文档，详细介绍了 vector register file 的设计细节，所以，这里就简要介绍一下，为理解后面的 Operand requester、Functional Unit 和 Operand queue 做准备。
+
+每个 lane 中的 VRF 由 8 个 bank 构成，每个 bank 为单端口 64 bit RAM，这个位宽和 vector functional unit 的 data path 的位宽是一致的。 在 RVV ISA 中，共有 V0-V31， 32 个向量寄存器，每个寄存器的长度（VLEN）是 implementation-defined。
+
+这里以 VLEN = 4096 bit 为例，则寄存器文件的大小为 ` 4096 bit * 32 = 16KB` ，假设 ara 协处理器总共有 4 个 lane，每个 lane 中的 VRF 为 4 KB。
+
+<img src="/assets/fpga/ara6.png" alt="image-20241101083826371" style="zoom:35%;" />
+
+每个 lane 中的 4k VRF 由 8 个 bank 构成，则每个 bank 大小为 512 Byte：
+
+<img src="/assets/fpga/ara7.png" alt="image-20241101083922695" style="zoom:40%;" />
+
+每个 lane 中的 VRF 大小共 4k， 则需要 12 bits 地址总线来寻址，后三位用来当做 bank 地址，剩余 9 位用来定位 bank 中的 byte，每个 bank 大小 512 Byte，位宽为 64 bits，则可寻址的范围为 64 (512/8), 由高 6 位(log(64))完成，剩余的 3 位地址用来确定每次读写的 64 bits 中的 byte 地址，参考下图：
+
+<img src="/assets/fpga/ara8.png" alt="image-20241101084215094" style="zoom:45%;" />
+
+那么 vector element 在 VRF 中如何分布的呢？
+
+假设 SEW = 64，即每个 element 的大小为 64 bit，在 `VLEN = 4096` 的情况下，每个 vector register 共有 `4096/64 = 64` 个 elements：
+
+<img src="/assets/fpga/ara9.png" alt="image-20241101090129793" style="zoom:50%;" />
+
+其在 VRF 中的分布如下所示：
+
+![image-20241101090222420](/assets/fpga/ara10.png)
+
+假设 SEW = 32，即每个 element 的大小为 32 bit，在 `VLEN = 4096` 的情况下，共有 `4096/32 = 128` 个 elements，其在 VRF 中的分布如下所示：
+
+![image-20241101090415303](/assets/fpga/ara11.png)
+
+VRF 模块中还包含了一个 stream_bar，用来将来自不同 memory bank 的数据送到不同的 Operand queue，由该结构控制：
+
+```verilog
+typedef struct packed {
+    vaddr_t addr; //寄存器地址
+    logic wen;    // write-enable
+    elen_t wdata; // 要写回的数据
+    strb_t be;    // byte-enable
+    opqueue_e opqueue; //把读出的数据放到哪个 Operand queue 中
+} payload_t;
+```
+
+## Operand Requester
+
+Operand requester 的作用是将每个 queue 中的 operand_request 转换成对 VRF 的请求。
+
+其处理逻辑如下：
+
+1. 如果此时状态为 IDLE 且 operand_request 有效
+
+   -  ack 这个请求，设置 next_state 为 REQUESTING
+   - 生成 operand_queue_cmd，设置 operand_queue_cmd_valid_o = 1
+   - 保存 requester_metadata_d 用来控制后续的 VRF 请求
+
+   ```verilog
+   // Address of the vstart element of the vector in the VRF                                 // This vstart is NOT the architectural one and was modified in the lane
+   // sequencer to provide the correct start address
+   vrf_addr = vaddr(operand_request_i[requester_index].vs, NrLanes, VLEN) 
+            + (operand_request_i[requester_index].vstart >>
+                (unsigned'(EW64) - unsigned'(operand_request_i[requester_index].eew)));
+   // Init helper variables
+   requester_metadata_tmp = '{
+     id          : operand_request_i[requester_index].id,
+     addr        : vrf_addr,
+     len         : effective_vector_body_length,
+     vew         : operand_request_i[requester_index].eew,
+     hazard      : operand_request_i[requester_index].hazard,
+     is_widening : operand_request_i[requester_index].cvt_resize == CVT_WIDE,
+     default: '0
+   };
+   ```
+
+2. 由于 VRF 由多个 bank 组成，且每个 vector register 分布在不同的 bank 上，所以，要获取一个 vector register 的数据，就需要依次向不同的 bank 发出读请求。从 VRF 的设计来看，可以同时从 8 个 bank 读数据，并放到 8 个 operand queue 中，但是没办法一次从 8 个 bank 中读取数据，放到一个 operand queue 中。也就是说，如果一个 vector register 由 8 个 bank 构成，那就需要分 8 次请求才能读完所需数据。
+
+   如果此时状态为 REQUESTING， 且 Operand queue 中的数据队列没有满，则构造 operand_payload，payload 最终会从 VRF 中的某个 bank 中读数据，其中 opqueue 表示此次从 addr 读取的 64 bit 数据要存放到哪个 operand queue 中， 如果 operand_requester_gnt 有效，表示仲裁器已经将 requester_index 的 operand_req 发送给了 VRF，可以更新 requester_metadata_d 中的 addr 和 len 信息，生成下个的 operand_req，如果 len = 0，表示此次请求已完成，状态设置为 IDLE
+
+```verilog
+// Bank we are currently requesting
+automatic int bank = requester_metadata_q.addr[idx_width(NrBanks)-1:0];
+
+// Did we get a grant?                                                                       logic [NrBanks-1:0] operand_requester_gnt;
+for (genvar bank = 0; bank < NrBanks; bank++) begin: gen_operand_requester_gnt
+  assign operand_requester_gnt[bank] = operand_gnt[bank][requester_index];
+end
+
+// Operand request
+operand_req[bank][requester_index] = !stall;
+operand_payload[requester_index]   = '{
+  addr   : requester_metadata_q.addr >> $clog2(NrBanks),
+  opqueue: opqueue_e'(requester_index),
+  default: '0 // this is a read operation
+};
+  
+// Received a grant.
+if (|operand_requester_gnt) begin : op_req_grant
+  // Bump the address pointer
+  requester_metadata_d.addr = requester_metadata_q.addr + 1'b1;
+
+  // We read less than 64 bits worth of elements 
+  num_bytes = ( 1 << ( unsigned'(EW64) - unsigned'(requester_metadata_q.vew) ) );
+  if (requester_metadata_q.len < num_bytes) begin
+    requester_metadata_d.len    = 0;
+  end
+  else begin  
+    requester_metadata_d.len = requester_metadata_q.len - num_bytes;
+  end
+end : op_req_grant
+
+// Finished requesting all the elements
+if (requester_metadata_d.len == '0) begin
+  state_d = IDLE;
+...
+```
+
+除此之外，Operand requester 还需要处理 VFU 写回的数据，所以需要扩大 operand_req 和 operand_payload 数组，让他们可以包含 write-back 的请求
+
+```verilog
+// The remaining five masters correspond to the ALU, the MFPU, the MASKU, the VLDU, and the SLDU.
+localparam NrMasters = NrOperandQueues + 5;
+logic     [NrBanks-1:0][NrMasters-1:0] operand_req;
+logic     [NrBanks-1:0][NrMasters-1:0] operand_gnt;
+payload_t [NrMasters-1:0]              operand_payload;
+```
+
+构建 VFU 对应的 operand_payload
+
+```verilog
+// Generate the payloads for write back operations                                           operand_payload[NrOperandQueues + VFU_Alu] = '{
+  addr   : alu_result_addr_i >> $clog2(NrBanks),
+  wen    : 1'b1,
+  wdata  : alu_result_wdata_i,
+  be     : alu_result_be_i,
+  default: '0
+};
+operand_payload[NrOperandQueues + VFU_MFpu] = '{
+  addr   : mfpu_result_addr_i >> $clog2(NrBanks),
+  wen    : 1'b1,
+  wdata  : mfpu_result_wdata_i,
+  be     : mfpu_result_be_i,
+  default: '0
+};
+...
+```
+
+设置 operand_req
+
+```verilog
+// Store their request value
+operand_req[alu_result_addr_i[idx_width(NrBanks)-1:0]][NrOperandQueues + VFU_Alu] =
+alu_result_req_i;
+operand_req[mfpu_result_addr_i[idx_width(NrBanks)-1:0]][NrOperandQueues + VFU_MFpu] =
+mfpu_result_req_i;
+...
+```
+
+设置 grant 信号，用来 ack VFU 的 write-back queue
+
+```verilog
+for (int bank = 0; bank < NrBanks; bank++) begin                                             alu_result_gnt_o  = alu_result_gnt_o | operand_gnt[bank][NrOperandQueues + VFU_Alu];
+  mfpu_result_gnt_o = mfpu_result_gnt_o | operand_gnt[bank][NrOperandQueues + VFU_MFpu];
+  masku_result_gnt  = masku_result_gnt | operand_gnt[bank][NrOperandQueues + VFU_MaskUnit];
+  sldu_result_gnt   = sldu_result_gnt | operand_gnt[bank][NrOperandQueues + VFU_SlideUnit];
+  ldu_result_gnt    = ldu_result_gnt | operand_gnt[bank][NrOperandQueues + VFU_LoadUnit];
+end
+```
+
+由于 `logic [NrBanks-1:0][NrMasters-1:0] operand_req` 包含了不同 Master (不同 operand queue 的读和不同 VFU 的写) 对不同 Bank 的请求，难免会产生同时对同一个 bank 的请求，此时就需要仲裁器来决定响应哪个 master 的请求，而写请求的优先级要高于读请求，所以还需要不同的优先级逻辑来处理这些请求。Operand_requester 为每个 bank 创建了 三个 rr_arb_tree（这个模块的逻辑，有空可以分析一下）：
+
+- 第一个仲裁器处理高优先级的 req，需要仲裁的 req 包括 VFU 所需的 `AluA, AluB, MulFPUA, MulFPUB, MulFPUC` 这几个 queue 的 read req 以及 VFU_Alu 和 VFU_MFpu 的 write-back queue 的 write req
+
+```verilog
+    rr_arb_tree #(
+      .NumIn    (unsigned'(MulFPUC) - unsigned'(AluA) + 1 + unsigned'(VFU_MFpu) - unsigned'(VFU_Alu) + 1),
+      .DataWidth($bits(payload_t)                                                   ),
+      .AxiVldRdy(1'b0                                                               )
+    ) i_hp_vrf_arbiter (
+      .clk_i  (clk_i ),
+      .rst_ni (rst_ni),
+      .flush_i(1'b0  ),
+      .rr_i   ('0    ),
+      .data_i ({operand_payload[MulFPUC:AluA],
+          operand_payload[NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]} ),
+      .req_i ({operand_req[bank][MulFPUC:AluA],
+          operand_req[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
+      .gnt_o ({operand_gnt[bank][MulFPUC:AluA],
+          operand_gnt[bank][NrOperandQueues + VFU_MFpu:NrOperandQueues + VFU_Alu]}),
+      .data_o (payload_hp    ),
+      .idx_o  (/* Unused */  ),
+      .req_o  (payload_hp_req),
+      .gnt_i  (payload_hp_gnt)
+    );
+
+```
+- 第二个仲裁器处理低优先级的 req，包括 MaskB, MaskM, StA, SlideAddrGenA 这些 queue 的 read-req，以及 `VFU_SlideUnit, VFU_MaskUnit, VFU_LoadUnit` 的 write-req
+
+- 第三个仲裁器用来从 payload_hp_req 和 payload_lp_req 中选出最终的 vrf_req_o，送给 VRF
+
+```verilog
+    rr_arb_tree #(
+      .NumIn    (2               ),
+      .DataWidth($bits(payload_t)),
+      .AxiVldRdy(1'b0            ),
+      .ExtPrio  (1'b1            )
+    ) i_vrf_arbiter (
+...
+      .data_i ({payload_lp, payload_hp}         ),
+      .req_i  ({payload_lp_req, payload_hp_req} ),
+      .gnt_o  ({payload_lp_gnt, payload_hp_gnt} ),
+      .data_o ({vrf_addr_o[bank], vrf_wen_o[bank], vrf_wdata_o[bank], vrf_be_o[bank], vrf_tgt_opqueue_o[bank]}),
+      .req_o (vrf_req_o[bank] ),
+      .gnt_i (vrf_req_o[bank] ) // Acknowledge it directly
+    );
+```
+
+## Operand Queue
+
+Operand queue 的逻辑就比较简单，主要包含了一个 data fifo 和 cmd fifo，用来缓存来自 VRF 和 Operand  requester 的数据和请求，data fifo 中的数据会根据 cmd fifo 中第一个 cmd 的类型进行特定转换，接着根据 VFU 的 Operand_valid 信号进行 pop，并统计第一个 cmd 已经发送给 VFU 的 element 数量，当该值大于等于该 cmd 所需的 element 数量时，就可以 pop cmd fifo，表示已经处理完这个 cmd 的 Operand request 了，可以继续处理下一个 cmd。
+
+## Functional unit
+
+这里仅分析 VALU 模块，作为理解 VFU 工作的大体逻辑，不过其中的 reduction 指令会涉及到 inter-lane 的数据交互，这里暂且选择性忽略。对于 VFPU 和 VMUL 这两个功能单元，读者可自行分析。
+
+VALU 中包含了一个 vinsn_queue，定义如下：
+
+```verilog
+struct packed {
+    vfu_operation_t [VInsnQueueDepth-1:0] vinsn; // instruction queue
+    logic [idx_width(VInsnQueueDepth)-1:0] accept_pnt;
+    logic [idx_width(VInsnQueueDepth)-1:0] issue_pnt;  // 要 issue 的指令索引
+    logic [idx_width(VInsnQueueDepth)-1:0] commit_pnt; // 要 commit 的指令索引
+    logic [idx_width(VInsnQueueDepth):0] issue_cnt; // queue 中还剩多少要 issue 的指令
+    logic [idx_width(VInsnQueueDepth):0] commit_cnt;// queue 中还剩多少要 commit 的指令
+} vinsn_queue_d, vinsn_queue_q;
+```
+
+instruction queue 中的 vinsn 来自 lane-sequencer，维护比较简单，这里就不再赘述。
+
+VALU 实际的运算工作由 simd_alu 完成，该模块每次能处理 64-bit 的数据，并生成 64 bit 的结果：
+
+```verilog
+case (vinsn_issue_q.vtype.vsew)
+      EW64: scalar_op = {1{vinsn_issue_q.scalar_op[63:0]}};
+      EW32: scalar_op = {2{vinsn_issue_q.scalar_op[31:0]}};
+      EW16: scalar_op = {4{vinsn_issue_q.scalar_op[15:0]}};
+      EW8 : scalar_op = {8{vinsn_issue_q.scalar_op[ 7:0]}};
+default:;
+        
+assign vinsn_issue_d  = vinsn_queue_d.vinsn[vinsn_queue_d.issue_pnt];
+assign alu_operand_a  = vinsn_issue_q.use_scalar_op ? scalar_op : alu_operand_i[0];
+assign alu_operand_b  = vinsn_issue_q.use_scalar_op ? scalar_op : alu_operand_i[1];
+
+simd_alu #(                                                                                   .FixPtSupport      (FixPtSupport                                                    )
+  ) i_simd_alu (
+    .operand_a_i       (alu_operand_a                                                   ),
+    .operand_b_i       (alu_operand_b                                                   ),
+    .valid_i           (valu_valid                                                      ),
+    .vm_i              (vinsn_issue_q.vm                                                ),
+    .mask_i            ((mask_valid_i && !vinsn_issue_q.vm) ? mask_i : {StrbWidth{1'b1}}),
+    .narrowing_select_i(narrowing_select_q                                              ),
+    .op_i              (vinsn_issue_q.op                                                ),
+    .vew_i             (vinsn_issue_q.vtype.vsew                                        ),
+    .vxsat_o           (alu_vxsat                                                       ),
+    .vxrm_i            (alu_vxrm_i                                                      ),
+    .rm                (r                                                               ),
+    .result_o          (valu_result                                                     )
+  );
+```
+
+这里值得注意的是，该模块的数据输入输出都是 64 bit，那么该如何处理 VEW != 64 的这种情况呢，答案也很直接：
+
+```verilog
+unique case (op_i)
+VADD, VADC, VMADC, VREDSUM, VWREDSUMU, VWREDSUM: unique case (vew_i)                             EW8: for (int b = 0; b < 8; b++) begin
+        automatic logic [ 8:0] sum = opa.w8 [b] + opb.w8 [b] +
+        logic'(op_i inside {VADC, VMADC} && mask_i[1*b] & ~vm_i); 
+        res.w8[b] = (op_i == VMADC) ? {6'b0, 1'b1, sum[8]} : sum[7:0];
+      end     
+    EW16: for (int b = 0; b < 4; b++) begin
+        automatic logic [16:0] sum = opa.w16[b] + opb.w16[b] +
+        logic'(op_i inside {VADC, VMADC} && mask_i[2*b] & ~vm_i); 
+        res.w16[b] = (op_i == VMADC) ? {14'b0, 1'b1, sum[16]} : sum[15:0];
+      end     
+    EW32: for (int b = 0; b < 2; b++) begin
+        automatic logic [32:0] sum = opa.w32[b] + opb.w32[b] +
+        logic'(op_i inside {VADC, VMADC} && mask_i[4*b] & ~vm_i); 
+        res.w32[b] = (op_i == VMADC) ? {30'b0, 1'b1, sum[32]} : sum[31:0];
+      end     
+    EW64: for (int b = 0; b < 1; b++) begin
+        automatic logic [64:0] sum = opa.w64[b] + opb.w64[b] +
+        logic'(op_i inside {VADC, VMADC} && mask_i[8*b] & ~vm_i); 
+        res.w64[b] = (op_i == VMADC) ? {62'b0, 1'b1, sum[64]} : sum[63:0];
+      end
+...
+```
+
+### 指令 issue
+
+1.在 vector 指令发射之前，计算该指令要发射的 vector element 数量：
+
+```verilog
+issue_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl / 8) >>
+              vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vtype.vsew;
+issue_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl[2:0];
+```
+
+2.当同时满足以下条件时：
+- `vinsn_issue_valid && !result_queue_full`
+- `alu_operand_valid_i[1] || !vinsn_issue_q.use_vs2`
+- `alu_operand_valid_i[0] || !vinsn_issue_q.use_vs1`
+
+设置 `valu_valid = 1'b1` 向 simd_alu 发射一条 micro-instruction
+
+3.ack operand queue，取出下个 operand
+   
+4.并缓存来自 simd_alu 的计算结果到 result_queue 中：
+
+```verilog
+result_queue_d[result_queue_write_pnt_q].wdata = result_queue_q[result_queue_write_pnt_q].wdata | valu_result;
+
+result_queue_d[result_queue_write_pnt_q].addr = vaddr(vinsn_issue_q.vd, NrLanes, VLEN) + ((vinsn_issue_q.vl - issue_cnt_q) >> (unsigned'(EW64) - unsigned'(vinsn_issue_q.vtype.vsew)));                                                       
+result_queue_d[result_queue_write_pnt_q].id   = vinsn_issue_q.id;
+```
+
+5.更新 result_queue_cnt_d 和 issue_cnt_d：
+
+```verilog
+result_queue_valid_d[result_queue_write_pnt_q] = 1'b1;
+result_queue_cnt_d += 1;
+result_queue_cnt_d += 1;
+issue_cnt_d = issue_cnt_q - element_cnt;
+```
+
+6.当 `issue_cnt_d !=0` 时，继续从 2 处开始处理
+   
+7.当 `issue_cnt_d == 0` 时，表明，本次正在处理的 vector 指令的所有元素都已经计算完毕，可以继续发射下一条指令了，即从 1 开始执行：
+
+```verilog
+// Bump issue counter and pointers
+vinsn_queue_d.issue_cnt -= 1;
+if (vinsn_queue_q.issue_pnt == VInsnQueueDepth-1)
+	vinsn_queue_d.issue_pnt = '0;
+else
+	vinsn_queue_d.issue_pnt = vinsn_queue_q.issue_pnt + 1;
+
+// Assign vector length for next instruction in the instruction queue
+...
+```
+
+### 指令 commit
+
+指令 commit 主要负责将 result queue 的数据正确的写回到 VRF 中，当还有需要 commit 的指令时，首先根据指令信息计算需要写回的 element 数量：
+
+```verilog
+commit_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vl / 8) >>
+            vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vtype.vsew;
+commit_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vl[2:0];
+```
+
+当接受到了来自 VRF 的 gnt 信号后
+
+1. 清除 result queue 中对应的数据
+2. 更新本次写回到寄存器的 element 数量到 commit_cnt_d
+3. 当commit_cnt_d 减为 0 时，设置 `alu_vinsn_done_o[vinsn_commit.id] = 1'b1; `标识已经处理完毕的指令，供 ara-sequencer 和 lane-sequencer 进行后续指令调度。并更新 `vinsn_queue_d.commit_pnt`， 去 commit 下一条指令。
+
+# VLSU
+
+TBD.
+
+# SLDU
+
+TBD.
+
+# MASKU
+
+TBD.
+
+# 参考引用
+
+1. https://zhuanlan.zhihu.com/p/465234640
