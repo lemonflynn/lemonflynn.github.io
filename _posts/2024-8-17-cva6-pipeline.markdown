@@ -197,4 +197,5 @@ amo:
 	-> commit_ack = amo_resp_i.ack
 ```
 
+
 除此之外，为了实现精确异常模型，所有来自流水线内部的 exception 和外部的 interrupt 也会在 commit 阶段被处理。
