@@ -6,11 +6,9 @@ categories: kernel
 ---
 **作者: flynn**
 
-
-
 ![image-20241026183159928](/assets/fpga/ara1.png)
 
-ara 是一个实现了 risc-v vector 指令集的协处理器。在 CVA6 处理器的基础上，需要修改指令解码，和在指令执行阶段，增加一个加速器指令分发的执行单元，来运行 vector 指令。本文主要分析，协处理器是如何执行 vector 指令的。
+ara 是一个实现了 risc-v vector 指令集的协处理器。在 CVA6 处理器的基础上，需要修改指令解码单元，标记指令流中 vector 指令，接着在指令执行阶段，增加一个加速器指令的前级 dispatcher，来分发 vector 指令到 ara 协处理器中。而本文主要分析，协处理器是如何 vector 指令的。
 
 # config parameters
 
@@ -57,7 +55,7 @@ typedef logic [ELEN-1:0] elen_t
 
 # Dispatcher
 
-TBD.
+ara 中的 dispatcher 主要是根据 cva6 送来的 accelerator_req_t，进行具体的 vector 指令解码工作，构造 ara_req_t，并处理由于 vector store/load 指令而引入的一些 stall 操作。
 
 # Ara Sequencer
 
