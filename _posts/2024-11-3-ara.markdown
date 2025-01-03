@@ -337,6 +337,9 @@ vinsn_running_d[pe_req.id] = (vfu_operation_d.vfu != VFU_None) ? 1'b1 : 1'b0;
 ```
 同时，构建 operand_request，注意， operand_request 是个长度为 9 的数组，对应 9 个 operand queue
 ```verilog
+operand_request_cmd_t [NrOperandQueues-1:0] operand_request;
+logic                 [NrOperandQueues-1:0] operand_request_push;
+
  unique case (pe_req.vfu)
         VFU_Alu: begin
           operand_request[AluA] = '{
@@ -406,7 +409,7 @@ typedef struct packed {
 
 ## Operand Requester
 
-Operand requester 的作用是将每个 queue 中的 operand_request 转换成对 VRF 的请求。
+Operand requester 的作用是将每个 operand_request queue 中的 operand_request 转换成对 VRF 的请求。
 
 其处理逻辑如下：
 
