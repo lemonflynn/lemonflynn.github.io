@@ -66,7 +66,7 @@ mask unit 是一个较为复杂的模块，因为它要实现的功能比较多�
 
    需要由 V0 (mask register) 提供进位信息，供 Lane 中的 ALU/FPU 使用
 
-5.  **vector mask control**
+5. **vector mask control**
 
    由  V0 (mask register)  进行 vector 指令的 **mask** 控制，由 MASKU 提供给 Lane 中的 ALU/FPU，设置对应 result_queue 的 **BE**（Byte Enable） 位
 
