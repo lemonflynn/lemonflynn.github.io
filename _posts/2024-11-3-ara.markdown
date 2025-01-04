@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Ara co-processor 分析"
+title:  "Ara co-processor 分析(上)"
 date:   2024-11-3 9:00:16 +0800
 categories: kernel 
 ---
@@ -676,7 +676,7 @@ issue_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl[2:0];
 设置 `valu_valid = 1'b1` 向 simd_alu 发射一条 micro-instruction
 
 3.ack operand queue，取出下个 operand
-   
+
 4.并缓存来自 simd_alu 的计算结果到 result_queue 中：
 
 ```verilog
@@ -696,7 +696,7 @@ issue_cnt_d = issue_cnt_q - element_cnt;
 ```
 
 6.当 `issue_cnt_d !=0` 时，继续从 2 处开始处理
-   
+
 7.当 `issue_cnt_d == 0` 时，表明，本次正在处理的 vector 指令的所有元素都已经计算完毕，可以继续发射下一条指令了，即从 1 开始执行：
 
 ```verilog

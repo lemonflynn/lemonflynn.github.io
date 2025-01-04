@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Ara co-processor 分析(2) MASKU and VLSU"
+title:  "Ara co-processor 分析(下)"
 date:   2025-1-1 9:00:16 +0800
 categories: kernel 
 ---
