@@ -336,6 +336,9 @@ vfu_operation_d.vstart = pe_req.vstart / NrLanes;
 vinsn_running_d[pe_req.id] = (vfu_operation_d.vfu != VFU_None) ? 1'b1 : 1'b0;
 ```
 同时，构建 operand_request，注意， operand_request 是个长度为 9 的数组，对应 9 个 operand queue
+
+
+
 ```verilog
 operand_request_cmd_t [NrOperandQueues-1:0] operand_request;
 logic                 [NrOperandQueues-1:0] operand_request_push;
@@ -362,6 +365,8 @@ logic                 [NrOperandQueues-1:0] operand_request_push;
           operand_request_push[AluA] = pe_req.use_vs1;
           //还有 operand_request[AluB] 和 operand_request[MaskM]
 ```
+
+
 
 ## VRF
 
