@@ -10,18 +10,18 @@ categories: kernel
 
 VLSU 包含三个模块，AddGen、Load Unit、Store Unit，其核心功能分别如下
 
-1. **ADDGen**
+**1. ADDGen**
 
 - VA->PA 地址转换
 - 根据 load-store 的 index 或 stride 类型，生成 AXI 请求，控制 AXI 总线的地址通道，并控制 load unit 或 store unit
 
-2. **Load Unit**
+**2. Load Unit**
 
 - 控制 AXI 总线的 R 通道读取数据
 - 把读到的数据写回 VRF
 - 处理 exception
 
-3. **Store Unit**
+**3. Store Unit**
 
 - 从 lane 中读取要写到内存的数据
 - 控制 AXI 总线的 W 通道写数据，以及 B 通道
