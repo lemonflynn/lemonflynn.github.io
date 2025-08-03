@@ -33,7 +33,10 @@ theme: minima
 plugins:
   - jekyll-feed
 
-google_analytics: G-ZZCR2DRHZ6
+analytics:
+  provider: "custom" # false (default), "google", "google-universal", "custom", "goatcounter"
+google:
+    tracking_id: G-ZZCR2DRHZ6
 
 classes: wide
 # Exclude from processing.
