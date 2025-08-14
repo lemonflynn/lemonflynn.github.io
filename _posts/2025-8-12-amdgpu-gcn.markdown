@@ -2,7 +2,7 @@
 layout: 
 title:  "AMD GCN 架构深度分析"
 date:   2025-8-12 7:00:16 +0800
-categories: GPU 
+categories: GPU
 ---
 
 <div class="custom-html">
