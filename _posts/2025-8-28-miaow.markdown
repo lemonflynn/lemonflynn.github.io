@@ -1,11 +1,9 @@
 ---
 layout: post
-title:  "MIAOW GCN 架构分析"
+title:  "MIAOW GCN 计算架构分析"
 date:   2025-8-28 6:00:16 +0800
 categories: GPU
 ---
-
-# MIAOW GCN 计算架构分析
 
 ## CU overview
 
