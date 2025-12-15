@@ -1,0 +1,134 @@
+---
+layout: post
+title:  "MIAOW GCN 架构分析"
+date:   2025-8-28 6:00:16 +0800
+categories: GPU
+---
+
+# MIAOW GCN 计算架构分析
+
+## CU overview
+
+<img src="/assets/fpga/miaow10.png" alt="image-20251215175411508" style="zoom: 50%;" />
+
+流水线可以分为以下几个阶段：
+
+![image-20251215175532974](/assets/fpga/miaow11.png)
+
+## fetch & wavepool
+
+<img src="/assets/fpga/miaow2.png" alt="image-20251211082033558" style="zoom:25%;" />
+
+miaow 微架构白皮书中， fetch 和 wavepool 的功能框图是唯一比较详实精确的，上图中的 WF_ID Gen 模块用来计算出 vacant 信号，表明可以从哪些 wf 中取指令（某些 wf 可能被 halt 了，或被 mask out 了），如果 wavepool 中某个 wf 的 instr queue 满了，则会设置  wave_stop_fetch 中对应的 bit，之后 round robin 调度器会选择一个 wf 来从 instr cache 中取出指令 + tag，送入 wavepool  中对应 wf 的 instr queue 中
+
+
+
+<img src="/assets/fpga/miaow3.png" alt="image-20251211082246203" style="zoom:40%;" />
+
+wavepool 中则包含一个 wq_pool 和 wavepool_controller，前者负责存储 wf 的指令 + tag，后者则需要处理
+
+1. 接受来自 instr cache 的数据 
+2. wave_queue 的流量控制 
+3. 根据 halt 和 branch 信号清空对应 wf 的 instr queue
+4. 从 scoreboard feeder 选出的 wf 的 wave_queue 中取指令送给 decode 阶段
+
+scoreboard feeder 的逻辑也比较简单，是根据 issue 阶段提供的 valid_wfid 从中降序选出可以 decode 的 wfid
+
+![image-20251211080631524](/assets/fpga/miaow1.png)
+
+## issue: wavefront scheduling and arbiter
+
+issue 模块是整个 CU 中最复杂的模块，要处理指令发射、指令退休、分支处理，其整体框图如下，为简单起见，这里没有画出 finished_wf、barrier_wait、mem_wait 的逻辑，后面有空再补上
+
+![image-20251213103551176](/assets/fpga/miaow4.png)
+
+其中 valid_entry 会根据 decode_wfid、issue_wfid、salu_branch_wfid 来生成有效的 valid_entry_out，表示所有已经解码但还没有发射的 wf，issue flow ctrl 会根据 valid_entry_out 来控制哪些 wf 可以继续取指令，产生 wave_valid_entry 信号也就是上面 scoreboard feeder 的输入，其逻辑如下：
+
+1. when valid goes down (which means inst issued)
+2. barrier, branch or wait_cnt inst retired
+3. don't ask new inst if last inst is a branch
+
+同时 valid_entry_out 和 fu_table 的输出以及 max_instr_inflight_array、pengding_branches_array、barrier_wait_array 和来自 scoreboard 的 ready_array_data_dependencies 信号进行 & 操作生成 simd_ready_to_issue 信号，共 40 bit，每个 bit 对应 simd 是否可以被发射，当指令有效，没有被 pending，不是 barrier wait，没有达到指令发射上限且不存在寄存器依赖关系时，就可以被置 1，送入 instr arbiter 等待被选择，instr arbiter 中包含，simd_arbiter、simf_arbiter、lsu_arbiter、salu_arbiter 四个 arbiter 分别用来从 40 个 ready 的 wf 中选择出一个 wf，其结果给 alu_issue，再根据不同 fu 的 ready 情况用来做最终的选择，alu_issue 的选择逻辑是，依次轮转 simd、simf、lsu、salu 这个四个 fu，每个 clock 会选择一个 fu，假如当前 clock 选中了要发射属于 simd fu 的指令，则再根据 simd 0-3 的 ready 情况，优先向编号低的 simd  发射指令 ，下个周期会选中 simf fu，然后依次类推。但是这里有个问题，如果当前选中了 simd fu，但是此时所有 simd 都不可用时，alu_issue logic 会怎么办？从代码来分析，貌似是不发射任何指令，这着实有些不合理了。下图中 select 共 9 bit，对应选择 simd 0-3、 simf 0-3、lsu、salu 中的哪个 fu。
+
+![image-20251213112911216](/assets/fpga/miaow5.png)
+
+下图是 scoreboard 模块的功能框图，其主要功能是用来记录寄存器的状态信息，用以解决寄存器依赖问题，其输入共分为以下 5 个：
+
+1. decoded wf 相关的很多信息
+2. issue 相关的 wfid
+3. vgpr 写回
+4. sgrp 写回
+5. exec 寄存器相关
+
+![image-20251215144048921](/assets/fpga/miaow26.png)
+
+当新 decode 一个 wf 的指令时，将以下信息
+
+```
+lds_base, branch, vcc_wr, scc_wr, exec_wr, m0_wr, instr_pc, opcode, imm_value0/1, source_reg 1/2/3/4, dest_reg 1/2
+```
+
+存入 instr_info_table 中，这样当发射一个 wf 指令或 write-back 某个 wf 指令时，就可以检索到对应信息。
+
+busy_gpr_table 中存储了物理寄存器的 busy 情况，在指令发射时置 1，指令退休时清 0。同时，它在指令 decode 时，需要根据所用到的物理寄存器来生成对应的 busy bits 来初始化 gpr_dependency_table 中寄存器依赖信息，假如当前指令使用了 reg0, reg4, reg8, reg 12 作为 src reg, reg 20, reg 24 作为 dst reg，那么最终的 busy bits 是
+
+```c
+/*
+src1、src4 和 dst1 会连续检测后面 3 个 reg
+其余的会连续检测后面 1 个 reg
+src  src src src dst dst
+1    2  3   4    1   2
+1100_00_00_1010_0001_11
+src1  |reg0 not busy
+      |reg1 not busy
+      |reg2 busy
+      |reg3 busy
+      
+src2  |reg4 busy
+      |reg5 busy
+      
+src3  |reg8 busy
+      |reg9 busy
+      
+src4  |reg12 not busy
+      |reg13 busy
+      |reg14 not busy
+      |reg15 busy
+      
+dst1  |reg20 busy
+      |reg21 busy
+      |reg22 busy
+      |reg23 not busy
+      
+dst2  |reg24 not busy
+      |reg25 not busy
+*/
+```
+
+gpr_dependecy_table 中标记了 40 个 wavefront，每个 wf 的逻辑寄存器的依赖情况，比如标记了当前 wf 指令使用的第一个 src reg，第二个 src reg，第三个 src reg 是否为 busy，0 表示 busy，会对每个 wf 所使用的寄存器进行 “&=” 操作，只有当 src1、src2、src3、 src4、dst1、dst2 都不 busy 时，才可以继续发射当前 wf 的指令，生成的 ready_array_data_dependencies 共 40 bits，对应 40 个 wf 的寄存器依赖情况，供 issue 模块使用。 ready_array_spr 是用来管理 special register 的，比如 vcc，scc，exec，m0 寄存器等。
+
+gpr_cmp 的作用是当退休一条指令时，根据 dst_reg_addr 和来自 instr_info table 中的对应指令信息，计算出应该清除哪个逻辑寄存器的 busy bit。scoreboard 中共有 5 个这样的模块，分别是 vgpr_alu_cmp, vgpr_lsu_cmp, sgpr_alu_cmp, sgpr_valu_cmp, sgpr_lsu_cmp。
+
+## SIMD
+
+每个 SIMD 包含 16 个 32 位 ALU，每个 wf 有 64 个 work item，如此一来，就需要 4 个时钟周期来运行一个 wf 的一条指令，对应 alu_fsm 中的 ex1、ex2、ex3、ex4 四个状态。SIMD 单元整体设计没有很复杂，如下图所示。
+
+![image-20251215161233023](/assets/fpga/miaow7.png)
+
+## LSU
+
+Lsu 负责从 memory 读取数据到寄存器，以及将寄存器内容写回 memory，其内部由状态机完成，如下
+
+![image-20251215163110457](/assets/fpga/miaow9.png)
+
+## 总结
+
+这个设计中不支持 graphics 功能、虚拟地址，TLB、LDS、缓存一致性协议以及多级 cache 设计（这些在 gem5 - amdgpu 中有实现，是个很不错的学习对象），并且用于 wf 分发的 thread dispather 的设计比较复杂，由于时间所限还没有仔细分析，以及对 SIMT stack 的分析还欠缺，还有很多细节没有仔细看，后面有空再补上吧。整体来看，MIAOW 的实现也是比较完备的，运行 OpenCL 程序应该没问题，有空可以把这个移植到 FPGA 上跑起来玩玩，应该还是很有意思的。
+
+最后来个 CU 的全览吧。
+
+![miaow](/assets/fpga/miaow8.png)
+
+## 参考引用
+
+miao_arch_white_paper
