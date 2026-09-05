@@ -1,15 +1,231 @@
 ---
 layout: post
-title:  "MIAOW GCN 计算架构分析"
+title:  "GCN 计算架构分析 - GEM5/MIAOW"
 date:   2025-8-28 6:00:16 +0800
 categories: GPU
 ---
+
+本文，首先从 GEM 5 中的 APU 实现来分析 GCN 计算架构的实现方式，便于理解其整体运行方式，最后再基于 MIAOW 来看看，在硬件 RTL 层面如何实现一个 CU。篇幅有限，在这里先省略对图形渲染相关的分析。
+
+## GCN 架构 overview
+
+![image-20260811081543657](/assets/fpga/gcn.png)
+
+GCN 属于 AMD 的第四代 GPU 架构，上一代 TeraScale 还是基于 VLIW 的 SIMD，也就是需要借助编译器来静态编排指令，来实现 ILP，最新的是 RDNA 和 CDNA，具体如下表：
+
+| 架构代际  | 核心架构                       | 代表系列 / 型号                                              | 核心制程              |                        关键新技术特性                        |
+| :-------- | :----------------------------- | :----------------------------------------------------------- | :-------------------- | :----------------------------------------------------------: |
+| **第1代** | **GCN 1.0** (Southern Islands) | Radeon HD 7700/7800/7900 系列 Radeon HD 8000 系列 (OEM)      | 28nm                  |            首代GCN架构，统一寻址，支持OpenCL 1.2             |
+| **第2代** | **GCN 2.0** (Sea Islands)      | Radeon HD 7790, R7/R9 260/260X                               | 28nm                  |                改进的几何引擎，支持OpenGL 4.3                |
+| **第3代** | **GCN 3.0** (Volcanic Islands) | Radeon R9 285/290/390, Fury 系列 (Fiji)                      | 28nm                  |          首个支持HBM高带宽显存 (Fiji)，改进色彩压缩          |
+| **第4代** | **GCN 4.0** (Polaris)          | **RX 400 系列** (Polaris 10/11) **RX 500 系列** (Polaris 20/21/12) | 14nm FinFET           |   首次采用14nm工艺，大幅提升能效比，支持HDMI 2.0b和DP 1.4    |
+| **第5代** | **GCN 5.0** (Vega)             | RX Vega 56/64, Radeon VII Radeon Pro 系列                    | 14nm/7nm              | 引入HBCC高带宽缓存控制器，支持FP16半精度运算，Radeon VII为首款7nm游戏卡 |
+| **第1代** | **RDNA 1.0**                   | **RX 5000 系列** (Navi 10/14)                                | 7nm                   | 专为游戏优化，重新设计流水线，每时钟性能提升25%，支持PCIe 4.0 |
+| **第2代** | **RDNA 2.0**                   | **RX 6000 系列** (Navi 21/22/23)                             | 7nm                   | **引入硬件光线追踪 (Ray Accelerator)**，加入Infinity Cache，支持Smart Access Memory |
+| **第3代** | **RDNA 3.0**                   | **RX 7000 系列** (Navi 31/32/33)                             | 5nm (GCD) + 6nm (MCD) | 采用**Chiplet (小芯片)** 设计，率先支持DisplayPort 2.1，AI加速器性能提升 |
+
+我们来看看 GCN3 的架构图：
+
+![image-20260811083427914](/assets/fpga/gcn1.png)
+
+一个 Compute-unit 内部的架构如下图：
+
+![image-20260811084146827](/assets/fpga/gcn2.png)
+
+
+
+## AMD gem5 APU simulator at CL
+
+gem5 可以模拟一个 APU 系统，其整体架构如下图：
+
+![image-20260813134111661](/assets/fpga/gcn3.png)
+
+### how to launch a kernel and wavefront
+
+整体软件和硬件的交互如下图：
+
+![image-20260813134351285](/assets/fpga/gcn4.png)
+
+其中 Command processor 用来处理 CPU 发送来的 PM4 命令包，传统图形渲染或计算的 GPU 任务提交方式如下：
+
+![image-20260813134527663](/assets/fpga/image-20260813134527663.png)
+
+由内核为每个 App 创建一个可供  GPU scheduler 调度的 entity，配合一定的调度算法（round-robin 或 fifo）将该 entity 中的命令提交给 hardware runqueue，然后由上图 GPU 中的 Command Processor 去处理，可以看到，这里的命令出现了多次拷贝，需要从用户态 -> 内核态 -> GPU。最新的工作方式是，GPU 为每个 APP 创建一个 hardware ring-queue，APP 直接往这个 ring 里提交命令，然后由 GPU 去做调度，如下图，其优点如图右边所示：
+
+![image-20260813135102219](/assets/fpga/gcn5.png)
+
+kernel launch 所涉及到的组件如下图：
+
+![image-20260813135544880](/assets/fpga/gcn6.png)
+
+上图中的 HW Queue Schduler 和 HSAPP， 我觉得可以对应到下图（来自 AMD 的 MES 手册）中的 MES engine 和 Compute QueueMgr：
+
+![image-20260813135942768](/assets/fpga/gcn7.png)
+
+HW queue scheduler 的工作流程如下图：
+
+<img src="/assets/fpga/gcn8.png" alt="image-20260813140223532" style="zoom:30%;" /> 
+
+1. driver write queue’s doorbell register, after fill CMD into Software Queue
+2. hw queue sched would starts to get commands from this queue via dma read 
+
+3. once read a pkt, process this pkt, if this’s a dispatch pkt, insert  AQL pkt into dispacher’s queue(all hw_queue’s pkt share this queue) with it’s queue_id
+
+4. Dispatcher dispatch kernel to execute
+5. when AQL pkt’s last wf finished execute, call hsaPacketProc().finishPkt()
+
+when sw_queue.size > hw_queue.size, call contexSwitchQ every 100ms, contexSwitchQ would map and unmap different HSA software queue at some scheduling logic.
+
+需要注意的是，doorbell register 也分不同类型，对应不同类型的 queue，gem5 中实现的 doorbell 分类有，compute、gfx、SDMAGfx、SDMAPage、ComputeAQL、interrupt handler、RLC 这几种类型，分别对应不同的 queue，SDMA 引擎主要处理数据拷贝，不过 gem5 也是部分实现了 SDMA 命令，对于 Compute 和  ComputeAQL Queue 类型的 queue，使用 PM4 进行命令编码，pkt processor 可以处理如下类型 pkt：
+
+- WRITE_DATA
+- MAP_QUEUES
+- UNMAP_QUEUES
+- RELASE_MEM
+- INDIRECT_BUFFER
+- SWITCH_BUFFER
+- SET_UCONFIG_REG
+- WAIT_REG_MEM
+- MAP_PROCESS
+- RUN_LIST
+- QUERY_STATUS
+- INVALIDATE_TLBS
+
+可以看到上图中的 pkt 都是和设置相关的，具体的 kernel launch 操作由 HSAPP 完成，其命令来自 HSA software queue 中的命令，由 ComputeAQL queue 的 doorbell 触发 GPU 操作，其可以处理的命令主要是：
+
+- KERNEL_DISPATCH
+
+- BARRIER_AND
+- BARRIER_OR
+
+KERNEL_DISPATCH 命令会把相关信息发给 dispatcher queue。
+
+下图中的 GPU Dispatcher 依据 dispatcher queue 中的 AQL pkt 进行 work-group dispatch：
+
+![image-20260813143507593](/assets/fpga/gcn9.png)
+
+现在来分析下 dispatcher 的工作逻辑：
+
+<img src="/assets/fpga/gcn10.png" alt="image-20260814091624334" style="zoom:50%;" />
+
+GPU dispatcher try dispatch all task in hsaQueue every clock
+
+1. foreach CU, call **hasDispResources** to check if the CU can dispatch,  numWfsToSched mark how many wfs will be disp at this SIMD, pay attention to loop sequence. note, shader->n_wf is 10, means have 10 wavefronts per SIMD, numVectorALUs is 4, means 4 SIMD per CU. so `wfList[4][10]` represent all wavefronts in a CU, which type is `std::vector<std::vector <WaveFront*>> wfList`
+
+![image-20260814091806568](/assets/fpga/gcn11.png)
+
+![image-20260814091922483](/assets/fpga/gcn12.png)
+
+2. if task has remaining wfs to dispatch, and this cu can dispatch, call **dispWorkGroup**, wf will be selected. update task dispatch status (like how many wf left to dispatch)
+
+![image-20260814091940583](/assets/fpga/gcn13.png)
+
+startWavefront will clear wavefront's IB, init regs, set PC of the wavefront and mark warefront Running：
+
+![image-20260814092008238](/assets/fpga/gcn14.png)
+
+至此，我们就在 CU 中激活了若干 wavefronts，上面主要介绍了 gem5 中的 amdgpu 模型是如何从 HSA software queue 中解析命令，直到选择、设置和激活 wavefronts，其实为了确保上述流程可以顺利工作，驱动这边，也是做了很多必备工作，我们可以参考一下 mesa 是如何通过 userq 直接下发 PM4 类型的 gfx 命令给 GPU 的，对应到 compute 任务，rocm 和 amdgpu-kfd 驱动的工作流程都类似，值得注意的是，在第 17 步触发了 doorbell，也就是 gem5 中的命令处理入口点：
+
+![image-20260814093047222](/assets/fpga/gcn15.png)
+
+### Inside a CU
+
+下图是 gem5 对 CU 的实现架构图：
+
+![image-20260814130920744](/assets/fpga/gcn16.png)
+
+可以发现，和 GCN 手册中的架构基本一致，其参数配置如下：
+
+	- 每个 CU 由 4 个 SIMD 组成
+	- 每个 SIMD 最多同时执行 10 个 wavefront
+	- 每个 SIMD 都有自己的 IB、64K Vector Register、16 通路 vector ALU，一个时钟可以处理 16 个 work-item，而一个 wavefront 有 64 个 work-item，所以一个 wavefront 的指令，需要 4 个 clock 才能执行完
+	- 4 个 SIMD 共享 Fetch 和 Decode 部分逻辑、TCP、LDS、Scalar-Unit
+
+指令运行流程如下图：
+
+<img src="/assets/fpga/gcn17.png" alt="image-20260814131056108" style="zoom: 50%;" /> 
+
+GCN ISA 有如下几类，gem5 中除了最后一类和图形管线相关的指令没有实现，其余的都有实现：
+
+<img src="/assets/fpga/gcn18.png" alt="image-20260814131337685" style="zoom:50%;" />
+
+gem5 中对 GCN 指令的模拟其实和对 cpu 指令的模拟差不多，比如，VOP2_V_ADD_F32 指令，其实现如下：
+
+<img src="/assets/fpga/gcn19.png" alt="image-20260814131647904" style="zoom: 33%;" />
+
+先来看看，inst fetch 是如何进行的，每个 SIMD 都分别管理 10 个 wavefront context，每个 wavefront context 包含一个 PC 和 instruction buffer
+
+<img src="/assets/fpga/gcn20.png" alt="image-20260814140143225" style="zoom: 33%;" />
+
+在详细的分析 instruction fetch 是如何工作之前，先来看看 gem5 对 amdgpu 的内存系统是如何建模的，
+
+![image-20260814140755010](/assets/fpga/gcn21.png)
+
+由于 GPU kernel 中的指令使用的是虚拟地址，所以 CU 的 sqc_tlb_port 主要用来完成指令的 va->pa 翻译，sqc_port 用来完成访存操作，memory_port 用来完成 vector-data 的访存操作，由于这部分连接关系复杂，我让 gemini 根据 gem5 中的 MI300X 配置生成了连接关系图，当做参考：
+
+![img_v3_0214i_e5a18959-82c7-46f5-b512-a9f1ae2efbcg](/assets/fpga/gcn22.png)
+
+整个取指流程如下图所示：
+
+![image-20260814141647975](/assets/fpga/gcn23.png)
+
+1. **Foreach** wavefront, if wf’s bufferedPCs has inst to decode, decode inst, push into wf’s IB
+2. **Foreach** wavefront, if wf is start & not stopped & fetch buf has free space, get nextFetchAddr, insert wf into fetch queue
+3. If fetch queue is not empty, use fetch scheduler choose a wavefront, call initiateFetch to fetch instruction
+4. Get inst pc Vaddr from wf, get a inst buf from freelist, insert into reserve pc
+5. Create a read request pkt to SQCtlb port, tlb will translate va->pa, after finish, tlbport send resp to CU
+6. CU send packet to SQC port to fetch instruction at pa
+7. after fetch done, move fetch buf from ReservePC to bufferedPCs
+
+接下来就是解码和发射，
+
+![image-20260816104212249](/assets/fpga/gcn24.png)
+
+上图看的不是很清晰，每个 SIMD 都有自己的 scheduler，负责从 10 个 wavefront 中选出可以若干条可以发射指令的 wavefronts
+
+![image-20260816104420176](/assets/fpga/gcn25.png)
+
+例如下图，
+
+![image-20260816104616653](/assets/fpga/gcn26.png)
+
+一个 scheduler 的工作逻辑是从众多 ready 的 wavefronts 中，根据其本周期发射的指令类型，最多选择 5 个不同指令种类的 wavefront，当有多个 wavefront 使用相同的 FU 时，只能根据特定规则，选择一个 wavefront。
+
+解码、发射和执行的整体流程如下图：
+
+<img src="/assets/fpga/gcn27.png" alt="image-20260816105419757" style="zoom:50%;" />
+
+gem5 为每一个 wavefront 都创建了一个 scoreboard，用来追踪指令源操作数的数据依赖是否存在，在 scoreboard check 阶段，一个时钟周期内，会判断所有 wavefronts 是否可以发射，是否存在数据依赖，根据判断结果，将要发射的 wavefront 的动态指令插入到每个 FU 特有的 readyWFs 结构中( 4 个 SIMD、一个 scalar core、一个 global mem pipe、一个 shared mem pipe、一个 scalar mem pipe)，动态指令被分到哪一个 readyWFs 如下图所示：
+
+<img src="/assets/fpga/gcn28.png" alt="image-20260816112321639" style="zoom:50%;" />
+
+在 scheduler 阶段，流程如下：
+
+1. if readyWFs not empty, use scheduler(oldest first?) choose an wf, pop an instr into schList
+2. start reg read, mark RFBusy
+3. iterate all inst in schList, if regfile is read complete, change state to RFReady
+4. pick the first ready inst, send to readyInsts
+
+在 exe 阶段，流程如下：
+
+1. if readyInst has ready instr, call ii->execute()
+2. according to func type, mark fu busy at ‘latency’ clock
+
+### 小结
+
+大体上，在这一节就介绍完了 GCN 架构里一个 wavefront 从创建、解码调度、读操作数、执行、到写回的整体脉络，接下来，还有很多实现细节，例如  vector ALU 的实现、 如何处理 mem instruction、分支指令、message 指令、vector 寄存器分配和回收、TLB coalese 的设计实现，cache-coherence 协议设计、Load-Acquire 指令处理的实现，等等，这些代码里都有实现，就太多了，可以自行去分析，这里先战略性 TBD 了。。。
+
+接下来，我们从 RTL 层面来看看，如何实现一个 CU
+
+## MIAOW at RTL level
+
+先来看 MIAOW 中，对一个 CU micro-arch 的概览：
 
 ## CU overview
 
 <img src="/assets/fpga/miaow10.png" alt="image-20251215175411508" style="zoom: 50%;" />
 
-流水线可以分为以下几个阶段：
+可以发现，这个和上一节 gem5 中的图差不多，流水线可以分为以下几个阶段：
 
 ![image-20251215175532974](/assets/fpga/miaow11.png)
 
@@ -129,4 +345,6 @@ Lsu 负责从 memory 读取数据到寄存器，以及将寄存器内容写回 m
 
 ## 参考引用
 
-miao_arch_white_paper
+1. https://chipsandcheese.com/p/gcn-amds-gpu-architecture-modernization
+2. THE AMD gem5 APU SIMULATOR: MODELING GPUS USING THE MACHINE ISA
+3. MIAOW Whitepaper Hardware Description and Four Research Case Studies

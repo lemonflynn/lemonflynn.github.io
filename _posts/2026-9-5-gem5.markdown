@@ -1,0 +1,622 @@
+---
+layout: post
+title:  "探索 GEM5 如何实现 LL/SC"
+date:   2026-8-28 6:00:16 +0800
+categories: GPU
+---
+
+GEM5 是一款优秀的开源 cpu 模拟器，使用 C++ 实现，其缓存一致性协议由 Ruby 实现，由 event 驱动，可以精确模拟 CPU 内部每个 clock 的状态。本文对该模拟器的 Out-of_Order CPU 主体进行深度分析，希望能理清其实现脉络，记录如下。
+
+## 楔：何为 LL/SC
+
+先来看一个有趣的问题，作为研究 GEM5 的引子
+
+```c
+static inline void arch_spin_lock(arch_spinlock_t *lock)
+{
+  unsigned int tmp;
+  arch_spinlock_t lockval, newval;
+  
+  asm volatile(
+  /* Atomically increment the next ticket. */
+  ARM64_LSE_ATOMIC_INSN(
+  /* LL/SC */
+" prfm pstl1strm, %3\n"
+"1: ldaxr %w0, %3\n"
+" add %w1, %w0, %w5\n"
+" stxr %w2, %w1, %3\n"
+" cbnz %w2, 1b\n",
+  ...
+  
+  : "=&r" (lockval), "=&r" (newval), "=&r" (tmp), "+Q" (*lock)
+	: "Q" (lock->owner), "I" (1 << TICKET_SHIFT)
+	: "memory");
+}
+```
+
+上图中的 ldaxr 和 stxr 是什么指令，有什么作用呢？上面的指令翻译如下：
+
+```c
+" prfm pstl1strm, %3\n"      // 预取 lock 到 L1 缓存，提示为流式存储（优化性能）
+"1: ldaxr %w0, %3\n"         // 独占加载 lock 的当前值到 %w0（带获取屏障，保证之后操作的顺序）
+" add %w1, %w0, %w5\n"       // %w1 = %w0 + 增量（新 next 值）
+" stxr %w2, %w1, %3\n"       // 独占存储 %w1 回 lock，成功则 %w2 = 0，失败则 %w2 = 1
+" cbnz %w2, 1b\n"            // 如果存储失败（%w2 ≠ 0），跳回 1 标签重试
+```
+
+#### Load-Acquire
+
+Arm 官方文档对该指令的解释是：
+
+- All explicit memory accesses after the LDAR are observed after the LDAR.
+
+- All explicit memory accesses before the LDAR are not aﬀected, and are reordered regarding the LDAR.
+
+<img src="/assets/gpu/gem5_0.png" alt="image-20260609105347147" style="zoom: 33%;" />
+
+#### Store-Release
+
+解释如下：
+
+- All explicit memory accesses before the STLR are observed before the STLR.
+
+- All explicit memory accesses after the STLR are not aﬀected, and are reordered regarding the STLR.
+
+<img src="/assets/gpu/gem5_1.png" alt="image-20260609105554772" style="zoom:33%;" />
+
+Load-Acquire 和 Store-Release 搭配使用，可以确保 critical code section 内部的 ld 和 st 指令不会乱序出 critical section 执行：
+
+<img src="/assets/gpu/gem5_2.png" alt="image-20260609170929582" style="zoom:33%;" />
+
+注意看上面的指令分别是 **LDAR** 和 **STLR**，是用来对同一个 CPU 执行的访存指令的顺序约束，更具体的说，就是告诉 CPU 哪些访存指令可以乱序，哪些必须在某个指令执行完以后才能执行。但是 **arch_spin_lock** 中使用的分别是 **LDAXR** 和 **STXR**，这是有区别的，其中的 **X**表示 **exclusive** 访问，是用来实现 Load-linked/Store-conditional 的，**LDXR** 和 **STXR** 搭配使用有如下效果：
+
+- cpu1 执行 ldxr 指令从内存地址 0xabcd 加载内容到寄存器，cpu1 监测 0xabcd 地址
+- cpu1 执行 stxr 指令将寄存器的值写入 0xabcd，但是这个操作执行与否有个条件，只有当其他 cpu 没有访问过 0xabcd 这个地址时，才会执行写内存操作，并且返回 0 表示执行成功，失败的话，返回 1
+
+仔细看，**arch_spin_lock** 中使用的是 **LDAXR**，该指令同时具备 Load-Acquire + exclusive 的语义，ARM 文档中解释，Load-Acquire、Store-Rlease 可以和 exclusive 访问随意搭配使用：
+
+- No Ordering semantics (using LDREX and STREX).
+
+- Acquire only semantics (using LDAEX and STREX).
+
+- Release only semantics (using LDREX and STLEX).
+
+- Sequentially consistent semantics (using LDAEX and STLEX).
+
+那么具体到 **arch_spin_lock** 函数，使用 **LDAXR** 的目的就是为了保证后面的 **访存** 指令不能提前到 **LDAXR** 指令之前执行，而 **stxr** 并不需要 release 语义，因为对于 spin_lock 拿锁的这个场景，release 时机未到，release 在 arch_spin_unlock 中执行，表示 critical section 结束。
+
+上述问题是个引子，希望通过分析一下 **LDAXR** 之类的指令是如何被 GEM5 实现的，串联起 GEM5 的骨架。
+
+## Event model 何以精确模拟 cpu
+
+TBD.
+
+## Life of an instruction
+
+gem5 的 O3CPU 模型实现上是基于 Alpha 21264 设计的，包含 bac、fetch、decode、rename、Issue/Execute/Writeback、commit 这几个流水线阶段，后面的分析基于 arm 的 neoverse v2 cpu，其微架构如下：
+
+![image-20260610104105735](/assets/gpu/gem5_4.png)
+
+gem5 通过 configs/common/cores/arm/neoverse_v2.py 这个文件来配置该 cpu，核心配置如下
+
+```python
+class NeoverseV2_BTB(SimpleBTB):
+    numEntries = 12 * 1024
+    tagBits = 18
+    associativity = 6
+    instShiftAmt = 2
+    btbReplPolicy = LRURP()
+    btbIndexingPolicy = BTBSetAssociative(
+        num_entries=Parent.numEntries,
+        set_shift=Parent.instShiftAmt,
+        assoc=Parent.associativity,
+        tag_bits=Parent.tagBits,
+    )
+    
+# TAGE Branch Predictor
+class NeoverseV2_BP(BranchPredictor):
+    conditionalBranchPred = TAGE_SC_L_64KB()
+    btb = NeoverseV2_BTB()
+    ras = ReturnAddrStack(numEntries=31)
+    instShiftAmt = 2
+    requiresBTBHit = True
+    takenOnlyHistory = True
+    
+class NeoverseMMU(ArmMMU):
+    itb = ArmTLB(
+        entry_type="instruction",
+        size=48,
+        assoc=12,
+    )
+    dtb = ArmTLB(
+        entry_type="data",
+        size=48,                                                                                                     assoc=48,
+    )
+    l2_shared = ArmTLB(
+        entry_type="unified", size=2048, assoc=8, partial_levels=["L2"]
+    )    
+class NeoverseV2(ArmO3CPU):
+     # Pipeline widths and delays
+    fetchWidth = 6
+    fetchBufferSize = 64
+    fetchToDecodeDelay = 3
+    decodeWidth = 6
+    decodeToRenameDelay = 2
+    renameWidth = 8
+    renameToIEWDelay = 1
+    renameToROBDelay = 1
+    dispatchWidth = 8
+    issueWidth = 8                                                                                                                     
+    issueToExecuteDelay = 1
+    wbWidth = 8
+    iewToCommitDelay = 1
+    commitWidth = 8
+    # Uncomment sqaush with for instant squash (restoring checkpoint)
+    # squashWidth = 8
+    trapLatency = 13
+    
+    numPhysIntRegs = 213
+    numPhysFloatRegs = 188
+    numROBEntries = 320
+    LQEntries = 175
+    SQEntries = 80
+    ...
+    # Decoupled front-end parameters
+    decoupledFrontEnd = True
+    fetchTargetWidth = 64
+    minInstSize = 4
+    numFTQEntries = 32
+```
+
+指令首先需要经过 fetch 取指。
+
+### Fetch
+
+***BAC*** 是 branch address calculation 的缩写，它主要是做了两件事 
+
+1. 分支预测，如果使用了解耦的前端设计，则独立于 fetch stage 
+2. 更新 PC，放在 fetch stage 进行。
+
+可以看到配置中使用了 decoupledFrontEnd。分支预测主要做的事情是根据当前 pc 值，以 minInstSize(这里是 4 bytes，也就是 32 位 的指令？是的，即使是 aarch64，其指令长度也是 32 位)为步长搜索 BTB，最大长度为 fetchTargetWidth，如果出现 BTB hit，意味着出现分支指令，需要调用 branch target unit 进行分支的方向和地址预测，如果是 branch taken 则需要截断当前 fetch target stream，并插入 fetch target queue，供后续 fetch stage 取用，目前配置 ”**maxTakenPredPerCycle = 1**“，意味着每个 cycle 只能允许出现一个 taken branch。假如 branch not taken，则意味着指令流还是连续的，继续生成 fetch target stream，最大长度由 fetchTargetWidth 确定，插入 fetch target queue，每个 cycle 最多可以生成 ”**maxFTPerCycle = 4**“ 条 fetch target stream。
+
+***Fetch*** 阶段首先根据当前 pc 值，判断其是否位于 etch target queue 中的第一条 fetch target stream 中，如果不在，重新生成 fetch target queue，并取消当前 cycle 的取指操作。fetchBuffer 是 64 字节，也就是 16 条指令，而当前配置的取指带宽是 6 条指令，所以完全够用。
+
+```c
+tick
+-> fetch
+	-> if fetch_status = running
+   	-> 如果 fetchBuffer（默认 64 字节） 为空，发起 fetchCacheLine 操作，切换 fetch 状态到 ItlbWait，并退出
+      -> build mem_req
+      -> cpu->mmu->translateTiming
+      -> fetch_status = ItlbWait
+   	-> 如果有中断发生，退出
+    -> 循环从 fetchBuffer 拿指令，最多 6 条 && 不能出现分支指令 && fetchQueue 未满
+       -> 此处忽略 micro-ops，先不分析
+       -> 解码静态指令
+       -> buildInst(this_pc, *next_pc) // 构建动态指令
+          -> create DynInst
+             -> set inst pc
+             -> set next_pc = predict_pc
+          -> push Dyninst into fetchQueue
+       -> this_pc = next_pc // 使用预测 pc 值
+    	 -> bac->updatePC(instruction, next_pc, curFT) //更新当前指令的 predict pc
+          -> if control inst, updatePreDecode // 这个比较复杂，使用了 分支预测器 进行预测
+          -> else pc + 4
+       -> 如果当前 pc 不在当前的 fetch target stream 中，使用 fetch target queue 中的下一个 FT
+-> pipelineIcacheAccesss //每个周期都会做指令预取
+
+//异步事件：TLB 翻译结束
+finishTranslation
+-> if no fault, get pa, build packet, icachePort.sendTimingReq
+   -> fetch_status = IcacheWaitResp
+
+//异步事件：收到 cache 的返回
+recvTimingResp
+-> processCacheCompletion
+   -> 更新 fetchBuffer
+   -> wakeCPU()
+   -> fetch_status = IcacheAccessComplete
+```
+
+
+
+~~ps. pc 值正常情况下，由 commit 阶段在退休一条指令时，通过~~ 
+
+```c
+head_inst->staticInst->advancePC(*pc[tid])
+advancePC 在 arch/arm/pcstate.hh 中定义，不考虑 micro-ops 的话，大体就是 next_pc = pc + 4
+```
+
+### Decode
+
+**Decode** 阶段比较简单。但是很繁琐，这里先忽略。
+
+### Rename
+
+**Rename** 阶段负责寄存器重命名，即给指令分配物理寄存器，以消解寄存器之间的假依赖（WAR 和 WAW）；还要处理 squash 发生时的寄存器映射恢复，此处采用的是 roll back 机制，而不是 checkpoint；同时对 barriers 指令进行特殊处理。
+
+<img src="/assets/gpu/gem5_5.png" alt="image-20260611133334271" style="zoom: 50%;" />
+
+先来看看 Rename 阶段比较重要的几个结构：
+
+Rename table: 用来存储 arch-reg -> phys-reg 的映射关系
+
+HistoryBuffer: 存储一条指令之前映射关系，当指令被 squash 时，用来恢复 Rename table
+
+FreeList: 保存了可用的物理寄存器
+
+在 GEM5 初始化的时候，会给每个 arch register 分配一个物理寄存器，如上图，假设有 A0 - A7 八个 arch register，GEM5 会首先给他们分别分配 P1 - P8 这几个物理寄存器，此时 free_list 中包保存剩下的 P9 - PN 个物理寄存器，当需要重命名 **inst 22** 时，**renameInsts** 函数会首先查找这个指令的源 arch 寄存器在 Rename Table 中的映射信息，得到物理寄存器值，并保存在其 Dyns inst 中，再给目的寄存器 A1 从 free_list 中分配一个物理寄存器 P9，将其更新到 Rename Table 中，Rename Table 从 T0 变为 T1，还要把 A1 之前的映射信息一并存入 HistoryBuffer 中。这样就完成了一次寄存器重命名。每周期最多重命名 8 条指令。 HistoryBuffer 的作用是，当 Inst 22 不幸被 kill 时，需要据此表中内容恢复之前的映射关系，比如从 T1 再恢复到 T0 时刻的 Rename Table。当 Inst 22 正常从 ROB 退休后，就可以从 HistorBuffer 中移除该项，并把 P2 放回 Free_list。
+
+当然 rename 之前，还需要做一些判断，比如 instQueue、ldqueue、stqueue 是否有空间，ROB 是否还有空间、闲置的物理寄存器是否够用，上述条件都不满足时，需要 block 寄存器重命名。
+
+rename 还会处理带有 serializeBefore 或 serializeAfter 标签的指令，这两个标签的意思是，让具备并行能力的 CPU，塌缩成串行执行的状态，主要是一些修改系统控制寄存器的指令会需要设置这种标签，比如 x86 的 CR 寄存器。serializeBefore 意思是在执行当前指令之前，前序指令必须都已经执行完。serializeAfter 是在当前指令还没有执行完以前，后续指令不能开始执行。由于 ARM 架构貌似没有用到这两个标签，所以这里先暂不展开。
+
+### Issue
+
+**Issue** 阶段负责把重命名之后的指令，分发给不同 function unit 的 instruction queue。 Neoverse cpu 有 9 个 instruction queue，
+
+```python
+    # The Neoverse Scheduler
+    # Configured according to https://chipsandcheese.com/p/arms-neoverse-v2-in-awss-graviton-4
+    instQueues = [                                                                                                   Neoverse_V2_IQ0(), Simple integer (ALU + branch), 22 entries
+        Neoverse_V2_IQ1(), 同上
+        Neoverse_V2_IQ2(), Complex integer (ALU + MUL + DIV + MADD), 22 entries
+        Neoverse_V2_IQ3(), 同上
+        Neoverse_V2_IQ4(), Floating point and vector units (128b FP + 128b ALU), 28 entries
+        Neoverse_V2_IQ5(), 同上
+        Neoverse_V2_IQ6(), Load Unit (Load AGU), 16 entries
+        Neoverse_V2_IQ7(), Load + Store Units, 16 entries
+        Neoverse_V2_IQ8(), Load + Store Units, 16 entries
+    ]
+    
+neoverse_v2.py 中有更详细的延迟信息定义
+```
+
+![image-20260612151057387](/assets/gpu/gem5_6.png)
+
+指令发射的流程如上图，根据指令类型插入指令到 instQueue 或 ldstQueue，其中还包括 non-speculate 指令的处理，指令发射的全流程如下图所示：
+
+![img_v3_0212j_98e84039-224d-44ea-a006-0ca9a5668ffg](/assets/gpu/gem5_7.png)
+
+指令 issue 需要做以下几件事：
+
+1. 将 rename 之后的指令 dispatch 到对应 FU 的 instruction queue 中 
+
+2. 将就绪指令存放在 readyInsts 中
+
+3. 指令唤醒
+4. 指令 schedule 到 FU
+
+经过 rename 的指令会被送入 ROB 中，同时会在 IEW 中进行指令发射，发射模块会根据指令类型将其放入 loadQ、storeQ、nonSpecQ 或 8 个 IQUnit 中的某一个中，这里需要注意的是 IQUnit 只进行了计数统计，并没有存储 DynInst，对于普通指令（非访存，推测执行的指令），在 dispatch 时 DynInst 会更新到 dependGraph 中。例如当一条指令所有的 src phy reg 都有数据时，直接将其插入对应 function unit 的 readyInst list 中，并根据其 dst reg index 更新在 dependGraph 中对应的指令，例如 setInst(P1, inst1)，表示 inst1 会更新 P1 寄存器。若 src phy reg 没有数据，则将其插入到 dependGraph 对应物理寄存器的 list 中，例如 inst5 的 src reg 是 P1，则调用 insert(P1, inst5)，将 inst5 插入 P1 对应的  slot 里，这样当 inst1 被 commit 时，issue 模块会根据 dependGraph 来唤醒依赖 inst1 的所有指令，也就是 inst2 和 inst5，将其通过 addIfReady 函数插入对应 FU 的 readyInst list 中。
+
+每个类型的 FU 都有自己的 readyInst list ，这是个按 seqnum 排序的 list，数字越低，表示指令越旧，排名靠前，保存着所有准备执行的动态指令，虽说每个 FU 的 readyInst list 中指令都已经按时间顺序进行了排序，但是真正要开始执行这些指令时， 不同 FU 之间的指令顺序是未知的，这样在指令调度时，就无法优先将最早的就绪指令发给 FU 执行，为了解决这个问题 ，addIfReady 函数在将就绪指令插入对应 FU 的 readyInst list 时，还会通过 addToOrderList 更新 listOrder 结构，该结构按时间顺序维护了每个 FU 中最早的指令是谁，每个 FU 只能有一个指令存在 listOrder 中，如上图所示，整体的指令顺序就可以依靠该结构确定，同时还有一个 readyIt 保存了对应 FU 最早指令在 listOrder 中的未知，这样，当调用 addIfReady 插入新动态指令时，就可以根据 readyIt 中的值，快速判断是否需要更新 listOrder，例如，如果要插入 类型 为 Alu 的 inst13 时，就可以快速判断 inst13 > inst11，跳过 listOrder 的修改；如果要插入类型为 Alu 的 inst10 时，就需要将 inst11 替换成 inst10。
+
+在发射了一条指令后，需要调用 moveToYoungerInst 更新 listOrder 和 readyIt，这样一来，最新可 issue 的指令永远都在 listOrder.head，这应该就是对应 collapse instruction queue（软件上模拟就是简单。。。），举例来说，假如发射了一条 Alu 指令之后，该函数会去拿 Alu 的 readyInst 中第一个指令，并将其按顺序插入 listOrder 中，并更新 readyIt。
+
+对于非推测执行的指令，在 issue 时，该指令会保存在 nonSpecInsts queue 中，只有当该指令走到 ROB 的 head 时（在 rename 时指令已经被放进 ROB 中了），则表明该指令已经是非推测的状态了，issue 模块会根据 commit 阶段提供的 seqnum 找到 nonSpecInsts queue 中对应的指令，将其通过 addIfReady 送入 fu 的 readyInsts 中。
+
+每个周期，可以发射多条指令。 
+
+### Execute
+
+指令执行由 executeInsts 函数完成，他会从 instToExecute 队列中拿取已经发射的指令，并按照以下顺序执行，每周期执行多条指令。
+
+![image-20260612172225513](/assets/gpu/gem5_8.png)
+
+对于普通指令，直接调用 inst->execute 进行计算。
+
+对于访存指令，会复杂很多，其会调用 executeStore/Load，这里仅分析 executeLoad 路径：
+
+<img src="/assets/gpu/gem5_9.png" alt="image-20260612172728294" style="zoom:50%;" />
+
+调用 inst->initateAcc 开始指令的访存操作，还函数一般在 mem.isa 中实现，不过第一次访存一般要先进行地址翻译，由于地址翻译可能会触发 TLB miss，所以翻译结果的就绪时间未知，因此此函数会在发起 TLB 地址转换以后，将该指令插入 deferMemInsts 中。
+
+```c
+mem.isa
+storeInitiateAcc
+-> writeMemTimingLE
+    ->xc->writeMem
+        |
+        |
+        v
+DynInst::writeMem
+-> cpu->pushRequest
+     -> iew.ldstQueue.pushRequest        
+```
+
+pushRequest 中进行 TLB 地址翻译的发起，等到（这里的“等”是把该指令放入 deferMemInst 进行异步等待）翻译结束后访问缓存，还需要检查 store buffer，如果有完整的地址重叠，则进行 data forward
+
+![image-20260612173151980](/assets/gpu/gem5_10.png)
+
+tlb walk 即完成虚拟地址到物理地址的翻译，其比较复杂，还会涉及到 mmu walker，这里不展开分析，整体流程如下图：
+
+![image-20260613113511170](/assets/gpu/gem5_12.png)
+
+sendPacketToCache 即发起缓存访问。等到缓存得到数据后，通过下述路径写回数据
+
+```c
+LSQUnit::recvTimingResp
+-> get request from pkt,
+-> request->recvTimingResp
+     -> LSQ::SingleDataReqeust::recvTimingResp
+          -> LSQUnit::completeDataAccess
+             -> writeback (inst, request->mainPacket)
+                -> if no fault, call inst->completeAcc
+                -> iewStage->instToCommit(inst)
+```
+
+completeAcc 函数由 arm/isa/templates/mem64.isa 等文件在编译时动态生成，最终在 build/ARM_X86/arch/arm/generated/exec-ns.cc.inc， 该函数将 pkt 中的数据写回目的寄存器。最终将指令 push 到 commit queue。
+
+<img src="/assets/gpu/gem5_11.png" alt="image-20260613112959438" style="zoom:50%;" />
+
+## 聚焦 LL/SC
+
+现在，我们可以回到最初的问题，“**gem5 是如何实现 ldar 和 stlr 的，以及 exclusive 能力？**”
+
+gem5 在 ldr64.isa 和 str64.isa 文件中，分别定义了
+
+``` c
+//load
+if self.flavor in ("acquire", "acex", "acexp"):
+                self.instFlags.extend(["IsWriteBarrier", "IsReadBarrier"])
+                self.memFlags.append("Request::ACQUIRE")
+
+if self.flavor in ("acex", "exclusive", "exp", "acexp"):
+                self.memFlags.append("Request::LLSC")
+                
+LoadRaw64("ldar", "LDARX64", size=8, flavor="acquire").emit()
+LoadEx64("ldaxr", "LDAXRX64", size=8, flavor="acex").emit()
+LoadEx64("ldxr", "LDXRX64", size=8, flavor="exclusive").emit()
+// store
+if self.flavor in ("release", "relex", "relexp"):
+                self.instFlags.extend(["IsWriteBarrier", "IsReadBarrier"])
+                self.memFlags.append("Request::RELEASE")
+
+if self.flavor in ("relex", "exclusive", "exp", "relexp"):
+                self.instFlags.append("IsStoreConditional")
+                self.memFlags.append("Request::LLSC") 
+
+StoreRaw64("stlr", "STLRX64", size=8, flavor="release").emit()
+StoreEx64("stlxr", "STLXRX64", size=8, flavor="relex").emit()
+StoreEx64("stxr", "STXRX64", size=8, flavor="exclusive").emit()
+```
+
+对于 ldar 指令，要实现下面的单向 barrier 效果，gem5 的操作是将该指令标记为 read barrier 和 write barrier，在指令发射时，该指令
+
+<img src="/assets/gpu/gem5_0.png" alt="image-20260609105347147" style="zoom: 33%;" />
+
+会插入 memDepUnit 中，该模块中追踪了所有 outstanding 的访存操作的序列号（memDepHash 结构），并且有两个 unorderer_set 数据结构（loadBarrierSNs 和 storeBarrierSNs），分别记录带有 loadBarrier 和 storeBarrier 的指令序列号。假设执行如下指令流
+
+```assembly
+inst2: ldar
+inst3: ld
+inst4: st
+```
+
+所以 **ldar** 在 insert 到该模块时，会做如下处理
+
+1. 将该指令插入 memDepHash
+2. 判断该指令是 load 指令，并且 loadBarrierSNs 为空，假设当前 outstanding 的指令里没有 load barrier
+3. 标记该指令可以发射
+4. 将该指令对应的 序列号 **inst2** 插入 loadBarrierSNs 和 storeBarrierSNs
+
+当发射后续的访存指令 inst3 和 inst4 时，同样需要 insert 到 memDepUnit，其处理变为
+
+1. 将该指令插入 memDepHash
+2. 根据指令类型从 loadBarrierSNs 或 storeBarrierSNs 中找到所有的 insts，此时应该返回 **inst2**
+3. 将 inst3 和 inst4 指令插入到 inst2 的 waken_list 上
+4. 标记 inst3 和 inst4 暂停发射
+5. 将 inst3 和 inst4 的 memDeps 设置成第 3 步得到的指令数，表明 inst3 和 inst4 有几条前置指令需要执行
+
+当 ldar 指令最终 commit 时，memDepUnit 会唤醒所有依赖 inst2 指令的指令，如此实现了单向 barrier。
+
+对于 store-release 来说
+
+<img src="/assets/gpu/gem5_1.png" alt="image-20260609105554772" style="zoom:33%;" />
+
+它的实现方式是，将 stlr 指令，设置为 non-speculate 方式，这样，只有当 stlr 指令真正走到 rob-head 时，才会去执行该指令，而此时 stlr 的前序指令都已经离开 rob 了，表明他们都执行完了，如此也实现了单向 barrier。
+
+对于 exclusive 来说，其执行流程如下：
+
+![image-20260615174835047](/assets/gpu/gem5_13.png)
+
+例如 ldrex 指令在执行时，会调用 handleLockedRead 标记对应的寄存器和 lock 地址。在 lsq 模块收到缓存控制器的数据时(**LSQ::recvTimingResp**)，需要进行判断，***如果此时 pkt 包含 Invalidate 标*志**，则表明其他 CPU 正在使用缓存一致协议 invalidate 该数据包内地址对应的数据，此时，需要进行 snoop check，需要遍历 load queue 中所有的 outstanding request，判断是否有地址重叠，如果地址重叠且此 ld request 也有 LLSC 标志，则表明这个 ld request 的独占访问失败，设置 MISCREG_LOCKFLAG = false。在后续 strex 指令执行时，lsq 模块会判断该 flag 是否为 true，为 true 则执行 store 操作，否则返回 false。
+
+对于 atomic 指令，其实也是使用 LL/SC 和 exclusive 的组合来实现的。
+
+```c
+/*
+ * AArch64 UP and SMP safe atomic ops.  We use load exclusive and
+ * store exclusive to ensure that these are atomic.  We may loop
+ * to ensure that the update happens.
+ */                                                                                                           
+#define ATOMIC_OP(op, asm_op, constraint)               \
+static __always_inline void                     \
+__ll_sc_atomic_##op(int i, atomic_t *v)                 \
+{                                   \
+    unsigned long tmp;                      \
+    int result;                         \
+                                    \
+    asm volatile("// atomic_" #op "\n"              \
+    "   prfm    pstl1strm, %2\n"                \
+    "1: ldxr    %w0, %2\n"                  \
+    "   " #asm_op " %w0, %w0, %w3\n"            \
+    "   stxr    %w1, %w0, %2\n"                 \
+    "   cbnz    %w1, 1b\n"                  \
+    : "=&r" (result), "=&r" (tmp), "+Q" (v->counter)        \
+    : __stringify(constraint) "r" (i));             \
+}
+```
+
+不过对于 ARM V8.1 来说，如果引入了 Large System Extensions (LSE)，用单一指令实现原子操作，不过我看其背后实现逻辑和上面一样。
+
+上面提到 lsq 模块中依赖 pkt 中的 invalidate 标志来触发 snoop check，而且需要遍历查找 load queue 中的 outstanding request 来确认是否有地址重叠，再去设置寄存器，但是细细一想，这里就有两个问题：
+
+问题1：什么情况下缓存控制器会发送 invalidate pkt，要是缓存控制器不发 invalidate pkt 呢？
+
+问题 2：假如 load queue 中的 ldxr 指令已经 commit 了，那后续的 snoop check 岂不是就失效了？
+
+要回答这两个问题，需要继续潜入缓存控制器的内部来窥探一二。
+
+## 缓存控制器
+
+简单起见，这里基于 MSI directory 的协议来分析，且是双核系统。如下图
+
+<img src="/assets/gpu/gem5_17.png" alt="image-20260618141206195" style="zoom:33%;" />
+
+假设两个 CPU 的缓存中最初都没有内存 0x100 的数据，
+
+1. CPU0 执行 ldxr X2 0x100
+
+![image-20260618132032367](/assets/gpu/gem5_15.png)
+
+2. CPU1 写 0x100 地址，此时缓存控制器中的状态转换如下图的上半部分所示， 
+
+
+
+<img src="/assets/gpu/gem5_16.png" alt="image-20260618105335193" style="zoom:33%;" />
+
+CPU0 的缓存行状态会从 S->I， CPU1 从 I->M， CPU0 的 cache controller 在收到 Dir 发出的 Invalidate 消息后从 S 切换到 I 时，会触发 forwardEviction，最终会向 CPU0 发出一个 invalidate pkt，触发上述 snook check，此时如果 CPU0 的 load queue 中还有 **“ldxr X2 0x100”** 指令，则 CPU0 就会检测到 LLSC 操作失败，这就回答了上节的第一个问题。
+
+这里需要注意， **llscClearMonitor**(0x100) 会清除 CPU0 的 cache controller 对 0x100 地址的监测。
+
+```c
+// 在收到 Inv event 时，从 S->I
+transition(S, Inv, I) {
+        sendInvAcktoReq;
+        forwardEviction;                                                                                     		     deallocateCacheBlock;
+        popForwardQueue;
+}
+action(forwardEviction, "e", desc="sends eviction notification to CPU") {                                 				if (send_evictions) {
+            sequencer.evictionCallback(address);
+        }
+}
+
+void Sequencer::evictionCallback(Addr address)
+{
+    llscClearMonitor(address); //清除 monitor
+    ruby_eviction_callback(address); // 发出 invalidate pkt，触发 lsq 中的 snoop check
+}
+```
+
+假设 CPU0 中的 load queue 中已经没有 **“ldxr X2 0x100”** 这个指令了，也没关系。
+
+3. CPU0 执行 stxr  %w2, %w1, 0x100，整体流程如下，其中椭圆框表示缓存行状态，绿色表示事件，紫框里是在状态切换时 cache controller 要做的事情，可以看到在最后 externalStoreHit 时，进行了 writeCallback 处理
+
+![image-20260618154055774](/assets/gpu/gem5_18.png)
+
+writeCallback 流程图如下：
+
+![image-20260618145434237](/assets/gpu/gem5_19.png)
+
+可以看到第 2 步，会进行 llsc 检查，查看是否还在对 0x100 地址进行监测，这里应该是返回 0，因为监测状态已经在 **evictionCallback** 中清除了，在第 4 步，如果检查结果是失败，则压根就不会更新 cache data block 的内容（这里要注意，cacheBlock 中已经有了从 CPU1 那里拿到的数据，这里的不更新指的是不更新 stxr 指令传入的值），同时最后的检查结果也会随着 extra_data 一路送给 dst register，这就回答了上一节的第二个问题。
+
+## 异常和中断
+
+在 commit 阶段，涉及到异常和中断的处理。
+
+首先需要检查是否有外部 interrupt，如果有，则暂停前端取指，并调用 handleInterrupt 去处理，其会 schedule 一个 trapEvent， 该 event 会在合适的时机触发 squash 信号，排空流水线，并调用 invoke 函数；
+
+同时要检查要 commit 的每一条指令是否有异常，如果有指令异常，则同样需要调用 invoke 函数进行处理；
+
+![image-20260616100835818](/assets/gpu/gem5_14.png)
+
+## cpu stages 之间的衔接
+
+我们知道各 cpu stages 直接是需要 pipeline register 进行前后级的数据流通，
+
+<img src="/assets/gpu/gem5_20.png" alt="image-20260715093727183" style="zoom:30%;" />
+
+如果使用 verilog 实现的话，就很简单，例如，
+
+```verilog
+reg M_WBSel, ...
+
+always @(posedge clk)
+begin
+        //Execute->Memory
+        M_WBSel     <= E_WBSel;
+        M_MemRW     <= E_MemRW;
+        M_RegWen    <= E_RegWen;
+        E_M_ra1     <= D_E_ra1;
+        //Memory->Write back
+        M_W_wd      <= wd;
+        M_W_wa			<= E_M_wa;
+        M_W_inst    <= E_M_inst;
+        complete_inst <= M_W_inst;
+        W_RegWen    <= M_RegWen;
+end
+```
+
+那么在 gem5 中，是如何实现的呢？
+
+gem5 使用了一个神奇的数据结构来实现，即 timebuffer 模板，举例来说，假如需要在 rename、iew 和 commit 三个 pipeline stage 之间传递和 rename 相关的数据，那么就分配一个 TimeBuffer <RenameStruct> renameQueue, 为什么命名为 Queue 呢？先看 RenameStruct 定义：
+
+```c
+struct RenameStruct
+{
+	int size;
+	DynInstPtr insts[MaxWidth];
+}
+```
+
+其表示 Rename 阶段在一个 clock 内 rename 的所有动态指令，所以取名中包含 Queue。那么这个 renameQueue 最终会如下图：
+
+<img src="/assets/gpu/gem_21.png" alt="img_v3_0213k_6f60fd95-3c0c-45af-aa88-e79932bcfa4g" style="zoom:50%;" />
+
+其本质就是一个 circular buffer，假设当前 base idx 为 2，wire1 通过 renameQueue->getWire(-1) 设定， wire2 通过 renameQueue->getWire(-2) ，分别表示落后于  base 1 个 clock 和 2 个 clock，rename stage 会使用 toIEW = renameQueue->getWire(0) 将 toIEW wire 和 base 对应起来，在 renameInsts 时，通过 toIEW->inits[index++] = inst 向当前 clock 对应的 pipe register （也就是 ptr[2] 处）中添加重命名之后的指令，在 cpu 模拟下一个 clock 周期时，通过调用 renameQueue.advance() 函数，renameQueue 变为
+
+<img src="/assets/gpu/gem5_22.png" alt="img_v3_0213k_34c4cd5c-8c2b-4466-a0fa-1774d4feba1g" style="zoom:50%;" />
+
+可以看到 wire1 对应的位置就变为了 ptr[2]，而 rename 阶段要使用的 toIEW 对应 ptr[3]，如此一来，就可以实现 pipeline register 的功能
+
+```verilog
+always @(posedge clk)
+begin
+    reg1 						<= rename.toIEW;
+    ... delay xx clock
+    iew.fromRename 	<= regxx;
+
+    reg2						<= iew.fromRename;
+    ... delay yy clock
+    commit.fromIEW <= regyy;
+end
+```
+
+pipeline 之间的局部衔接关系如下图，前缀是 to 的 wire 都对应 base idx，前缀 from 的 wire 都会有一定的延迟。
+
+![img_v3_0213k_a845f925-0bd4-474f-ae0f-f0735305dbdg](/assets/gpu/gem5_23.png)
+
+这里需要注意每个 stage 都会有 TimeStruct 类型的 timebuffer，并且都会向 wire(0) 对应的地方写数据，那么不会有冲突吗？其实并不会，因为各个 stage 只会修改 TimeStruct 的特定部分，并不会同时修改(应该是这样)，应该是抽象对应各个 stage 之间的控制通路。其结构如下
+
+```c
+struct TimeStruct
+{
+	FetchComm 	fetchInfo;
+  DecodeComm 	decodeInfo;
+  RenameComm 	renameInfo;
+  IewComm 		iewInfo;
+  CommitComm 	commitInfo;
+  bool block;
+}
+```
+
+那么还有一个问题，如果在 advance timebuffer 时，另一个 stage 在读写 timebuffer 时岂不是会出错？完全不用担心，gem5 是单线程模拟，这种情况不会发生，所有操作 timebuffer 的动作会在 tick 函数内按顺序完成，最后才会 advance timebuffer。
+
+## 测试 LL/SC
+
+TBD.
+
+## 总结
+
+GEM5 博大精深，本文仅对 LL/SC 的实现路径进行了深度分析，后续有机会再进行其他方向的学习。
+
+## 参考引用
+
+1. https://www.gem5.org/documentation/general_docs/cpu_models/O3CPU
+1. https://www.gem5.org/documentation/learning_gem5/part2/memoryobject/
+1. https://www.gem5.org/documentation/learning_gem5/part3/cache-in-ports/
+1. gem5 src
+1. A primer on memory consistency and cache controller
+1. learn_the_architecture_memory_systems ordering and_barriers_guide_102336_0101_01_en.pdf
+1. Anatomy of the gem5 Simulator- AtomicSimpleCPU, TimingSimpleCPU, O3CPU, and Their Interaction with the Ruby Memory System
