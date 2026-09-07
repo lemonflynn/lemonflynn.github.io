@@ -87,15 +87,23 @@ amdgpu_mn_register(bo, addr) //addr is cpu va
    
 // 假设你有一个多线程的程序，运行在一个 4 核 CPU 上，多个线程共享同一个进程的内存空间（即同一个 mm_struct）。
 // CPU 0： 线程 A 正在调用 madvise(DONTNEED) 主动释放 A 内存段，这会触发 invalidate_range_start()。
-// CPU 1： 线程 B 恰好因为内存不足（Page Fault），触发了内存回收（Reclaim），内核决定要换出（Swap out）该进程的 B 内存段，这也会触发 invalidate_range_start()。
-// 如果这里使用传统的互斥锁（Mutex），那么当 CPU 0 在清理 A 内存时，CPU 1 就必须死等（Block），直到 CPU 0 搞完。在大型服务器（比如几百个 CPU 核心）上，这种死等会带来巨大的性能灾难，因此，mmu_notifier 采用了无锁计数器的方式：
-// 
-// 无论是哪个 CPU 先触发了 start()，它只需要把一个全局的 notifier_count 计数器 ｜=1 变为奇数（表示当前有多个写者正在修改页表）。写者（mm 侧）绝不阻塞： CPU 0 和 CPU 1 都可以各自开开心心地去修改自己的页表（这里不对？如果使用了 split_page_table_lock，则可以同时修改同一个 mm 内不同 va 对应的 pte），不需要互相等待。
-// 可以参考 
+// CPU 1： 线程 B 恰好因为内存不足（Page Fault），触发了内存回收（Reclaim），
+// 内核决定要换出（Swap out）该进程的 B 内存段，这也会触发 invalidate_range_start()。
+// 如果这里使用传统的互斥锁（Mutex），那么当 CPU 0 在清理 A 内存时，CPU 1 就必须死等（Block），
+// 直到 CPU 0 搞完。在大型服务器（比如几百个 CPU 核心）上，这种死等会带来巨大的性能灾难，
+// 因此，mmu_notifier 采用了无锁计数器的方式：
+// 无论是哪个 CPU 先触发了 start()，它只需要把一个全局的 notifier_count 计数器 ｜=1 
+// 变为奇数（表示当前有多个写者正在修改页表）。
+// 写者（mm 侧）绝不阻塞： CPU 0 和 CPU 1 都可以各自开开心心地去修改自己的页表
+// （这里不对？如果使用了 split_page_table_lock，则可以同时修改同一个 mm 内不同 va 对应的 pte），
+// 不需要互相等待。可以参考 
 /Documentation/mm/process_addrs.rst
 /Documentation/mm/mmu_notifier.rst
 
-// 压力给到读者（KVM/GPU 侧）： 此时，如果 KVM 尝试去读取 PTE 并建立 SPTE，它发现 notifier_count > 0（有写者在搞事情），KVM 就会知道：“哦，现在有别的 CPU 正在拆房呢，我这时候建地基肯定会出问题。” 于是 KVM 放弃本次操作，等一会儿再来重试（Collision-Retry）。
+// 压力给到读者（KVM/GPU 侧）： 此时，如果 KVM 尝试去读取 PTE 并建立 SPTE，
+// 它发现 notifier_count > 0（有写者在搞事情），KVM 就会知道：
+// “哦，现在有别的 CPU 正在拆房呢，我这时候建地基肯定会出问题。” 
+// 于是 KVM 放弃本次操作，等一会儿再来重试（Collision-Retry）。
  
  /*
  * As a secondary function, holding the full write side also serves to prevent
@@ -196,11 +204,13 @@ spin_lock 后面的 if 判断需要进行下面三种情况的判断：
     spin_lock(&subscriptions->lock);
     if (subscriptions->active_invalidate_ranges) {
         if (mn_itree_is_invalidating(subscriptions))
-            // 此时为 fully exclude 状态，不允许修改 itree，先将 interval 插入 deferred_list
+            // 此时为 fully exclude 状态，不允许修改 itree，
+            // 先将 interval 插入 deferred_list
             hlist_add_head(&interval_sub->deferred_item,
                        &subscriptions->deferred_list);
         else {
-            // 此时为 partial exclude 状态，可以直接更新 itree，但是也要设置 invalidate_seq 为奇数，
+            // 此时为 partial exclude 状态，可以直接更新 itree，
+            // 但是也要设置 invalidate_seq 为奇数，
             // 切换到 fully exclude 状态
             subscriptions->invalidate_seq |= 1;
             interval_tree_insert(&interval_sub->interval_tree,
@@ -212,9 +222,10 @@ spin_lock 后面的 if 判断需要进行下面三种情况的判断：
         // 但是为什么设置 invalidate_seq = subs->invalidate_seq - 1 ?
         // 在设计中，interval_sub->invalidate_seq 只能是奇数
         // invalidate_seq 如果和 subs->invalidate_seq 相等，则表明该 interval 正在被 invalidate，
-        // 显然当前并没有在 invalidate，且 invalidate_seq 是个递增的数字，所以设置为 subs->invalidate_seq-1
-        // 表示这个 interval 没有在被 invalidate，那为啥不直接设置成 1？可能是担心刚好和 subs->invalidate_seq 相等，导  
-        // 致误判 ？
+        // 显然当前并没有在 invalidate，且 invalidate_seq 是个递增的数字，
+        // 所以设置为 subs->invalidate_seq-1 表示这个 interval 没有在被 invalidate，
+        // 那为啥不直接设置成 1？可能是担心刚好和 subs->invalidate_seq 相等，
+        // 导致误判 ？
         interval_sub->invalidate_seq =
             subscriptions->invalidate_seq - 1;
         interval_tree_insert(&interval_sub->interval_tree,
@@ -265,11 +276,13 @@ spin_lock 后面的 if 判断需要进行下面三种情况的判断：
      * subscriptions->invalidate_seq is even in the idle state.
      */
     // 这个注释也很难理解，他这里提到的 wrap 应该是这样一种情况：
-    // 假设区间 A 的 seq(即 interval seq)一直保持比如说 3， 但是全局 seq(即 subs->seq) 一直从 3 一路增加，在此期间
-    // 从来没有动过区间 A 的 seq，那么如果全局 seq 发生了 wrap，从 0xfffffffff 跳到了 3，那么此时会错误的认为区间 A
-    // 在 invalidating，此时就会错误的 wait，不过这也不会无限制的等待下去，因为当变为 idle state 时，全局 seq 最终会变为
-    // 偶数，且会 wakeup all。
-    // 如果 区间 seq 可以为偶数呢？这个考虑起来比较费脑，先忽略吧。。。反正设计上不允许区间 seq 为偶数。
+    // 假设区间 A 的 seq(即 interval seq)一直保持比如说 3， 但是全局 seq(即 subs->seq) 
+    // 一直从 3 一路增加，在此期间从来没有动过区间 A 的 seq，那么如果全局 seq 发生了 wrap，
+    // 从 0xfffffffff 跳到了 3，那么此时会错误的认为区间 A 在 invalidating，
+    // 此时就会错误的 wait，不过这也不会无限制的等待下去，因为当变为 idle state 时，
+    // 全局 seq 最终会变为偶数，且会 wakeup all。
+    // 如果 区间 seq 可以为偶数呢？这个考虑起来比较费脑，
+    // 先忽略吧。。。反正设计上不允许区间 seq 为偶数。
 		if (is_invalidating)
         wait_event(subscriptions->wq,
                READ_ONCE(subscriptions->invalidate_seq) != seq);
